@@ -63,13 +63,21 @@ class Plugin:
         with self._send_lock:
             self.sock.sendall(struct.pack(">I", len(body)) + body + payload)
 
-    def subscribe(self, video=None, audio=None, state=False):
-        """video: {"maxWidth", "fps", "format": "bgra"|"jpeg", "quality"}; audio: {"rate", "channels"}."""
-        self.send({"type": "subscribe", "video": video, "audio": audio, "state": state})
+    def subscribe(self, video=None, audio=None, state=False, input=False):
+        """video: {"maxWidth", "fps", "format": "bgra"|"jpeg", "quality"}; audio: {"rate", "channels"};
+        input: receive clicks / ⌥-drag boxes / Esc on the video in on_input."""
+        self.send({"type": "subscribe", "video": video, "audio": audio, "state": state, "input": input})
 
     def draw(self, layer, items, ttl=0):
         """Replace this plugin's `layer` with `items`; it disappears after `ttl` seconds (0 = keep)."""
         self.send({"type": "draw", "layer": layer, "items": items, "ttl": ttl})
+
+    def hud(self, text, key="default", color=None, ttl=0):
+        """Show `text` on the HUD's plugin line under `key`; "" removes it, ttl > 0 expires it."""
+        msg = {"type": "hud", "key": key, "text": text, "ttl": ttl}
+        if color:
+            msg["color"] = color
+        self.send(msg)
 
     def clear(self, layer=None):
         self.send({"type": "clear", "layer": layer} if layer else {"type": "clear"})
@@ -90,6 +98,14 @@ class Plugin:
     def center(self):
         self.send({"type": "center"})
 
+    def record(self, action="toggle"):
+        """action: "start", "stop" or "toggle"."""
+        self.send({"type": "record", "action": action})
+
+    def snapshot(self):
+        """Save the next frame, full resolution, as a JPEG next to the recordings."""
+        self.send({"type": "snapshot"})
+
     def set_options(self, items):
         """Declare settings for pocket-viewer's Plugins menu, e.g.
         {"key": "follow", "title": "Follow", "type": "bool", "value": True} or
@@ -107,6 +123,7 @@ class Plugin:
     def on_audio(self, chunk: AudioChunk): pass
     def on_state(self, state): pass
     def on_set(self, key, value): pass
+    def on_input(self, event): pass  # {"event": "click", x, y} / {"event": "select", x, y, w, h} / {"event": "cancel"}
 
     def _read_exact(self, n):
         buf = bytearray()
@@ -124,9 +141,9 @@ class Plugin:
         payload = self._read_exact(header["size"]) if header.get("size") else b""
         return header, payload
 
-    def run(self, video=None, audio=None, state=False):
+    def run(self, video=None, audio=None, state=False, input=False):
         """Subscribe and dispatch messages until pocket-viewer goes away."""
-        self.subscribe(video=video, audio=audio, state=state)
+        self.subscribe(video=video, audio=audio, state=state, input=input)
         try:
             while True:
                 h, payload = self.receive()
@@ -138,6 +155,8 @@ class Plugin:
                     self.on_video(VideoFrame(h["pts"], h["width"], h["height"], h["format"], payload))
                 elif t == "audio":
                     self.on_audio(AudioChunk(h["pts"], int(h["rate"]), h["channels"], h["frames"], payload))
+                elif t == "input":
+                    self.on_input(h)
                 elif t == "set":
                     self.on_set(h.get("key"), h.get("value"))
                 elif t == "state":

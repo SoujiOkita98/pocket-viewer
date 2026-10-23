@@ -2,6 +2,8 @@
 //
 //   Arrow keys / WASD   move gimbal by one step      [ ]  step smaller / larger
 //   Mouse drag          pan/tilt with the mouse      scroll / + -  zoom
+//   Click / ⌥-drag      point at / box something for plugins (e.g. tracker); Esc cancels
+//   Space (hold)        push-to-talk for plugins (e.g. ai-agent)
 //   c                   center                       m    toggle audio monitoring (output: Audio Output menu)
 //   Audio Output menu → Echo Cancellation (experimental): voice-processed capture, see echocancel.h
 //   f                   toggle fullscreen            q    quit
@@ -41,6 +43,8 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
 @interface OverlayView : NSView
 @property(nonatomic, weak) AVCaptureVideoPreviewLayer *preview;
 @property(nonatomic) CGSize videoSize;
+@property(nonatomic) NSRect selection;  // ⌥-drag rubber band, normalized; empty when none
+- (NSPoint)normalize:(NSPoint)point;    // view point -> normalized video coordinates
 - (void)setItems:(NSArray *)items forKey:(NSString *)key ttl:(double)ttl;
 - (void)removeKeysWithPrefix:(NSString *)prefix;
 - (void)keepClients:(NSSet<NSNumber *> *)clientIDs;  // drops layers of disconnected plugins
@@ -104,6 +108,16 @@ static double num(NSDictionary *d, NSString *key, double fallback) {
       [_layers removeObjectForKey:key];
       self.needsDisplay = YES;
     }
+}
+
+- (void)setSelection:(NSRect)selection {
+  _selection = selection;
+  self.needsDisplay = YES;
+}
+
+- (NSPoint)normalize:(NSPoint)p {
+  NSRect v = self.videoRect;
+  return NSMakePoint((p.x - NSMinX(v)) / v.size.width, (NSMaxY(v) - p.y) / v.size.height);
 }
 
 // Where the video lands in this view under the preview's current scaling.
@@ -181,6 +195,17 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
     }
   }
 
+  if (!NSIsEmptyRect(self.selection)) {
+    NSRect s = self.selection;
+    NSPoint tl = pt(NSMinX(s), NSMinY(s)), br = pt(NSMaxX(s), NSMaxY(s));
+    NSBezierPath *path = [NSBezierPath bezierPathWithRect:NSMakeRect(tl.x, br.y, br.x - tl.x, tl.y - br.y)];
+    CGFloat dash[] = {6, 4};
+    [path setLineDash:dash count:2 phase:0];
+    path.lineWidth = 2;
+    [NSColor.whiteColor setStroke];
+    [path stroke];
+  }
+
   // Subtitles stack upward from the bottom of the visible video, centered and wrapped.
   double y = NSMinY(visible) + 24;
   for (NSDictionary *item in subtitles.reverseObjectEnumerator) {
@@ -220,8 +245,14 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
 @property(nonatomic) NSDate *recordingSince;  // nil when not recording
 @property(nonatomic, copy) NSMenu * (^menuProvider)(void);  // right-click menu
 @property(nonatomic) OverlayView *overlay;
+// Clicks, ⌥-drag boxes and Esc on the video, for plugins (see "input" in PROTOCOL.md).
+@property(nonatomic, copy) void (^inputHandler)(NSDictionary *event);
 - (void)fillGravityMenu:(NSMenu *)menu;
 - (void)handlePluginCommand:(NSDictionary *)msg;  // gimbal / zoom / roll / center
+// Plugin status shown on a HUD line of its own. key is "clientID/name"; empty
+// text removes it, ttl > 0 expires it.
+- (void)setHudText:(NSString *)text color:(NSColor *)color forKey:(NSString *)key ttl:(double)ttl;
+- (void)keepHudClients:(NSSet<NSNumber *> *)clientIDs;
 - (NSDictionary *)gimbalState;
 @end
 
@@ -236,12 +267,16 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
   BOOL _sendPending, _zoomSendPending;
   double _actualPan, _actualTilt;  // read back from the camera every 0.2 s
   double _lastCommand;             // CACurrentMediaTime of the last pan/tilt command
+  NSPoint _mouseDown;              // view coordinates
+  BOOL _dragged, _selecting;       // this press moved / is an ⌥-drag selection
+  NSMutableDictionary<NSString *, NSDictionary *> *_pluginHud;  // key -> {text, color, expires}
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
   if ((self = [super initWithFrame:frame])) {
     _gimbalQueue = dispatch_queue_create("gimbal", DISPATCH_QUEUE_SERIAL);
     _step = 5;
+    _pluginHud = [NSMutableDictionary dictionary];
     _hasGimbal = gimbal_open(&_range) == 0 && gimbal_get(&_pan, &_tilt) == 0 &&
                  gimbal_get_zoom(&_zoom) == 0 && gimbal_get_roll(&_roll) == 0;
     _zoomTarget = _zoomPos = _zoom;
@@ -297,12 +332,48 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
     int t = (int)-self.recordingSince.timeIntervalSinceNow;
     rec = [NSString stringWithFormat:@"🔴 REC %02d:%02d:%02d   ", t / 3600, t / 60 % 60, t % 60];
   }
-  self.hud.stringValue =
+  NSString *line =
       [NSString stringWithFormat:@" %@%@ %@   %@   audio%@ %@ %-20s %5.0f dB ", rec, self.formatInfo,
                                  self.gravityName, gimbal, self.echoCanceller ? @" [AEC]" : @"",
                                  self.monitoring ? @"🔊" : @"🔇",
                                  meter.UTF8String, db];
+  NSDictionary *attrs = @{NSFontAttributeName : self.hud.font, NSForegroundColorAttributeName : NSColor.whiteColor};
+  NSMutableAttributedString *text = [NSMutableAttributedString new];
+  // Plugin segments go on a line above the built-in one, in key order (plugin, then name).
+  double now = CACurrentMediaTime();
+  NSArray *keys = [_pluginHud.allKeys sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+  for (NSString *key in keys) {
+    NSDictionary *seg = _pluginHud[key];
+    if ([seg[@"expires"] doubleValue] < now) {
+      [_pluginHud removeObjectForKey:key];
+      continue;
+    }
+    NSMutableDictionary *a = [attrs mutableCopy];
+    a[NSForegroundColorAttributeName] = seg[@"color"];
+    [text appendAttributedString:[[NSAttributedString alloc] initWithString:@" " attributes:attrs]];
+    [text appendAttributedString:[[NSAttributedString alloc] initWithString:seg[@"text"] attributes:a]];
+    [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"  " attributes:attrs]];
+  }
+  if (text.length) [text appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n" attributes:attrs]];
+  [text appendAttributedString:[[NSAttributedString alloc] initWithString:line attributes:attrs]];
+  self.hud.attributedStringValue = text;
   [self.hud sizeToFit];
+}
+
+- (void)setHudText:(NSString *)text color:(NSColor *)color forKey:(NSString *)key ttl:(double)ttl {
+  if (!text.length) {
+    [_pluginHud removeObjectForKey:key];
+  } else {
+    if (text.length > 200) text = [text substringToIndex:200];
+    text = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet] componentsJoinedByString:@" "];
+    _pluginHud[key] = @{@"text" : text, @"color" : color, @"expires" : @(ttl > 0 ? CACurrentMediaTime() + ttl : INFINITY)};
+  }
+  [self updateHud];
+}
+
+- (void)keepHudClients:(NSSet<NSNumber *> *)clientIDs {
+  for (NSString *key in _pluginHud.allKeys)
+    if (![clientIDs containsObject:@(key.intValue)]) [_pluginHud removeObjectForKey:key];
 }
 
 // Coalesces rapid updates (key repeat, mouse drag) so the USB pipe only ever
@@ -483,8 +554,16 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
                                                           : @"stretch";
 }
 
+- (void)sendInput:(NSDictionary *)event {
+  if (self.inputHandler) self.inputHandler(event);
+}
+
 - (void)keyDown:(NSEvent *)event {
   switch (event.keyCode) {
+    case 53: [self sendInput:@{@"event" : @"cancel"}]; return;  // Esc
+    case 49:                                                     // Space: push-to-talk
+      if (!event.isARepeat) [self sendInput:@{@"event" : @"key", @"key" : @"space", @"state" : @"down"}];
+      return;
     case 126: _tilt += _step; [self sendPosition]; return;  // up
     case 125: _tilt -= _step; [self sendPosition]; return;  // down
     case 123: _pan -= _step; [self sendPosition]; return;   // left
@@ -511,11 +590,51 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
   }
 }
 
+- (void)keyUp:(NSEvent *)event {
+  if (event.keyCode == 49) [self sendInput:@{@"event" : @"key", @"key" : @"space", @"state" : @"up"}];
+}
+
+- (void)mouseDown:(NSEvent *)event {
+  _mouseDown = [self convertPoint:event.locationInWindow fromView:nil];
+  _dragged = NO;
+  _selecting = (event.modifierFlags & NSEventModifierFlagOption) != 0;
+}
+
+- (NSRect)selectionTo:(NSEvent *)event {
+  NSPoint a = [self.overlay normalize:_mouseDown];
+  NSPoint b = [self.overlay normalize:[self convertPoint:event.locationInWindow fromView:nil]];
+  NSRect r = NSMakeRect(MIN(a.x, b.x), MIN(a.y, b.y), fabs(a.x - b.x), fabs(a.y - b.y));
+  return NSIntersectionRect(r, NSMakeRect(0, 0, 1, 1));
+}
+
 - (void)mouseDragged:(NSEvent *)event {
+  NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  if (hypot(p.x - _mouseDown.x, p.y - _mouseDown.y) > 3) _dragged = YES;
+  if (_selecting) {
+    self.overlay.selection = [self selectionTo:event];
+    return;
+  }
   // Drag the scene: moving the mouse right pans right, up tilts up.
   _pan += event.deltaX * 0.15;
   _tilt -= event.deltaY * 0.15;
   [self sendPosition];
+}
+
+// A click (no drag) or a finished ⌥-drag box goes to plugins, in normalized
+// video coordinates, origin top-left.
+- (void)mouseUp:(NSEvent *)event {
+  if (_selecting && _dragged) {
+    NSRect r = [self selectionTo:event];
+    self.overlay.selection = NSZeroRect;
+    if (r.size.width > 0.005 && r.size.height > 0.005)
+      [self sendInput:@{@"event" : @"select", @"x" : @(r.origin.x), @"y" : @(r.origin.y),
+                        @"w" : @(r.size.width), @"h" : @(r.size.height)}];
+    return;
+  }
+  if (_dragged) return;
+  NSPoint n = [self.overlay normalize:_mouseDown];
+  if (n.x < 0 || n.x > 1 || n.y < 0 || n.y > 1) return;  // on the letterbox
+  [self sendInput:@{@"event" : @"click", @"x" : @(n.x), @"y" : @(n.y)}];
 }
 
 - (void)scrollWheel:(NSEvent *)event {
@@ -545,6 +664,7 @@ static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *colo
 @property(nonatomic, copy) NSString *videoCodec, *audioFormat, *outputDir;
 @property(nonatomic) NSURL *lastRecording;
 @property(nonatomic) BOOL quitAfterRecording;
+@property(atomic) BOOL snapshotPending;  // set on main, consumed on the video queue
 @property(nonatomic) NSWindow *window;
 @property(nonatomic) ControlView *view;
 @property(nonatomic) AVCaptureSession *session;
@@ -851,6 +971,7 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   view.overlay.preview = preview;
   __weak AppDelegate *weakSelf = self;
   view.menuProvider = ^NSMenu * { return [weakSelf contextMenu]; };
+  view.inputHandler = ^(NSDictionary *event) { [weakSelf.plugins broadcastInput:event]; };
   preview.frame = view.bounds;
   preview.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
   [view.layer insertSublayer:preview atIndex:0];
@@ -1391,6 +1512,10 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
     timing.decodeTimeStamp = kCMTimeInvalid;
     if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, buffer, 1, &timing, &hostTimed)) return;
   }
+  if (output == self.videoData && self.snapshotPending) {
+    self.snapshotPending = NO;
+    [self saveSnapshot:CMSampleBufferGetImageBuffer(buffer)];
+  }
   if (output == self.videoData) {
     [writer appendVideo:hostTimed];
     [self.plugins pushVideo:hostTimed];
@@ -1398,6 +1523,31 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
     [self.plugins pushAudio:hostTimed];
   }
   CFRelease(hostTimed);
+}
+
+// Saves one full-resolution frame as a JPEG next to the recordings. Any queue.
+- (void)saveSnapshot:(CVPixelBufferRef)pb {
+  if (!pb) return;
+  CIImage *image = [CIImage imageWithCVPixelBuffer:pb];
+  NSDateFormatter *df = [NSDateFormatter new];
+  df.dateFormat = @"yyyyMMdd-HHmmss-SSS";
+  NSString *dir = self.outputDir;
+  NSURL *url = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:
+      [NSString stringWithFormat:@"pocket-viewer-%@.jpg", [df stringFromDate:NSDate.date]]]];
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    NSError *err;
+    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    BOOL ok = [[CIContext contextWithOptions:nil]
+        writeJPEGRepresentationOfImage:image
+                                 toURL:url
+                            colorSpace:srgb
+                               options:@{(id)kCGImageDestinationLossyCompressionQuality : @0.92}
+                                 error:&err];
+    CGColorSpaceRelease(srgb);
+    NSLog(@"snapshot %@: %@%@", ok ? @"saved" : @"FAILED", url.path,
+          err ? [@"  " stringByAppendingString:err.localizedDescription] : @"");
+  });
 }
 
 - (void)recordingStarted:(NSURL *)url {
@@ -1498,6 +1648,20 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   } else if ([type isEqual:@"gimbal"] || [type isEqual:@"zoom"] || [type isEqual:@"roll"] ||
              [type isEqual:@"center"]) {
     [self.view handlePluginCommand:msg];
+  } else if ([type isEqual:@"hud"]) {
+    NSString *key = [msg[@"key"] isKindOfClass:NSString.class] ? msg[@"key"] : @"default";
+    NSString *text = [msg[@"text"] isKindOfClass:NSString.class] ? msg[@"text"] : @"";
+    [self.view setHudText:text
+                    color:colorFromHex(msg[@"color"], NSColor.whiteColor)
+                   forKey:[prefix stringByAppendingString:key]
+                      ttl:num(msg, @"ttl", 0)];
+  } else if ([type isEqual:@"record"]) {
+    NSString *action = msg[@"action"];
+    BOOL start = [action isEqual:@"start"], stop = [action isEqual:@"stop"];
+    if ([action isEqual:@"toggle"] || (start && !self.isRecording) || (stop && self.isRecording))
+      [self toggleRecording:nil];
+  } else if ([type isEqual:@"snapshot"]) {
+    self.snapshotPending = YES;  // the next video frame is saved
   } else if ([type isEqual:@"options"]) {
     [self plugin:client declaredOptions:msg[@"items"]];
   } else if ([type isEqual:@"log"]) {
@@ -1511,6 +1675,7 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   NSMutableSet *ids = [NSMutableSet set];
   for (PluginClient *c in self.plugins.clients) [ids addObject:@(c.clientID)];
   [self.view.overlay keepClients:ids];
+  [self.view keepHudClients:ids];
 }
 
 - (void)fillPluginsMenu:(NSMenu *)menu {
@@ -1555,15 +1720,17 @@ static NSString *shellQuote(NSString *s) {
 
 - (void)loadPlugin:(id)sender {
   NSOpenPanel *panel = [NSOpenPanel openPanel];
-  panel.message = @"Choose a plugin: an executable, or a .py / .sh script";
+  panel.message = @"Choose a plugin: an executable, or a .py / .sh / .ts / .js script";
   panel.prompt = @"Load";
   [panel beginSheetModalForWindow:self.window
                 completionHandler:^(NSModalResponse r) {
     if (r != NSModalResponseOK) return;
     NSString *path = panel.URL.path;
     NSString *ext = path.pathExtension.lowercaseString;
+    BOOL node = [@[ @"ts", @"js", @"mjs" ] containsObject:ext];  // Node 22.18+ runs TypeScript as is
     NSString *cmd = [ext isEqual:@"py"]   ? [@"python3 " stringByAppendingString:shellQuote(path)]
                     : [ext isEqual:@"sh"] ? [@"/bin/sh " stringByAppendingString:shellQuote(path)]
+                    : node                ? [@"node " stringByAppendingString:shellQuote(path)]
                                           : shellQuote(path);
     [self.plugins launch:cmd];
   }];

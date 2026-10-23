@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>io.github.c4pt0r.pocket-viewer.transcribe</string>
+  <key>CFBundleName</key><string>pocket-viewer transcribe</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>Transcribe speech from the DJI Pocket 3 for pocket-viewer plugins.</string>
+</dict>
+</plist>

@@ -34,7 +34,7 @@ static double numberIn(NSDictionary *d, NSString *key, double fallback) {
 @property(readwrite, nullable) NSTask *task;
 // Subscriptions: written on the main thread, read from the push threads.
 @property(atomic, copy, nullable) NSDictionary *videoSpec, *audioSpec;
-@property(atomic) BOOL wantsState;
+@property(atomic) BOOL wantsState, wantsInput;
 // Audio conversion state, used only on the server's audio queue.
 @property(nonatomic, nullable) AVAudioConverter *converter;
 @end
@@ -290,6 +290,7 @@ static BOOL writeAll(int fd, const uint8_t *p, size_t n) {
     c.videoSpec = specFrom(msg[@"video"]);
     c.audioSpec = specFrom(msg[@"audio"]);
     c.wantsState = specFrom(msg[@"state"]) != nil;
+    c.wantsInput = specFrom(msg[@"input"]) != nil;
     dispatch_async(_audioQueue, ^{ c.converter = nil; });  // spec may have changed
   } else {
     [_delegate pluginClient:c sent:msg];
@@ -506,6 +507,13 @@ static AVAudioPCMBuffer *pcmFromSampleBuffer(CMSampleBufferRef sb) {
   msg[@"type"] = @"state";
   for (PluginClient *c in self.snapshot)
     if (c.wantsState) [c send:msg payload:nil done:nil];
+}
+
+- (void)broadcastInput:(NSDictionary *)event {
+  NSMutableDictionary *msg = [event mutableCopy];
+  msg[@"type"] = @"input";
+  for (PluginClient *c in self.snapshot)
+    if (c.wantsInput) [c send:msg payload:nil done:nil];
 }
 
 @end

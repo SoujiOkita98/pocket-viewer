@@ -46,6 +46,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)pushVideo:(CMSampleBufferRef)buffer;
 - (void)pushAudio:(CMSampleBufferRef)buffer;
 - (void)broadcastState:(NSDictionary *)state;  // to clients subscribed to "state"
+- (void)broadcastInput:(NSDictionary *)event;  // to clients subscribed to "input"
 - (void)send:(NSDictionary *)message to:(PluginClient *)client;
 
 @end

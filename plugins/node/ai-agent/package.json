@@ -1,0 +1,22 @@
+{
+  "name": "pocket-viewer-ai-agent",
+  "private": true,
+  "type": "module",
+  "description": "pocket-viewer plugin: a voice agent that can see through the camera, built on the pi SDK",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "typebox": "1.3.27"
+  },
+  "scripts": {
+    "start": "node ai-agent.ts",
+    "check": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "24",
+    "typescript": "5.9"
+  }
+}

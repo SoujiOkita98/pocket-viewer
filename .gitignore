@@ -6,3 +6,4 @@ pocketctl
 *.mov
 .openai-key
 plugins/bin/
+node_modules/

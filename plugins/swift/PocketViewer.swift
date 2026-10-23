@@ -27,6 +27,9 @@ public final class PocketViewer {
   public var onState: (([String: Any]) -> Void)?
   /// The user changed one of the settings declared with `setOptions` (key, value).
   public var onSet: ((String, Any) -> Void)?
+  /// A click ("click": x, y), an ⌥-drag box ("select": x, y, w, h) or Esc
+  /// ("cancel") on the video, normalized, origin top-left. Needs subscribe(input: true).
+  public var onInput: (([String: Any]) -> Void)?
   public private(set) var state: [String: Any] = [:]
 
   private let fd: Int32
@@ -80,13 +83,23 @@ public final class PocketViewer {
   }
 
   /// video: ["maxWidth": 640, "fps": 15, "format": "bgra"|"jpeg"]; audio: ["rate": 16000, "channels": 1]
-  public func subscribe(video: [String: Any]? = nil, audio: [String: Any]? = nil, state: Bool = false) {
-    send(["type": "subscribe", "video": video ?? NSNull(), "audio": audio ?? NSNull(), "state": state])
+  public func subscribe(video: [String: Any]? = nil, audio: [String: Any]? = nil, state: Bool = false,
+                        input: Bool = false) {
+    send(["type": "subscribe", "video": video ?? NSNull(), "audio": audio ?? NSNull(), "state": state,
+          "input": input])
   }
 
   /// Replaces this plugin's `layer`; it disappears after `ttl` seconds (0 = keep).
   public func draw(_ layer: String, _ items: [[String: Any]], ttl: Double = 0) {
     send(["type": "draw", "layer": layer, "items": items, "ttl": ttl])
+  }
+
+  /// Shows `text` on the HUD's plugin line, under `key` (one segment per key).
+  /// Empty text removes it; `ttl` > 0 removes it after that many seconds.
+  public func hud(_ text: String, key: String = "default", color: String? = nil, ttl: Double = 0) {
+    var m: [String: Any] = ["type": "hud", "key": key, "text": text, "ttl": ttl]
+    if let color { m["color"] = color }
+    send(m)
   }
 
   public func clear(_ layer: String? = nil) {
@@ -108,7 +121,25 @@ public final class PocketViewer {
   /// Changes arrive through `onSet`; send this again whenever values change.
   public func setOptions(_ items: [[String: Any]]) { send(["type": "options", "items": items]) }
 
+  /// Re-runs this program with `--key value` in its arguments, to apply a
+  /// setting that is only read at startup. pocket-viewer still knows the new
+  /// process (same POCKET_VIEWER_TOKEN). Returns only if exec fails.
+  public func restart(setting key: String, to value: String) {
+    var args = CommandLine.arguments
+    if let i = args.firstIndex(of: "--" + key), i + 1 < args.count { args[i + 1] = value } else { args += ["--" + key, value] }
+    log("\(key) → \(value), restarting")
+    let argv = args.map { strdup($0) } + [nil]
+    execvp(args[0], argv)
+    log("restart failed: \(String(cString: strerror(errno)))")
+  }
+
   public func zoom(_ zoom: Double) { send(["type": "zoom", "zoom": zoom]) }
+  public func zoom(by dzoom: Double) { send(["type": "zoom", "dzoom": dzoom]) }
+  public func center() { send(["type": "center"]) }
+  /// "start", "stop" or "toggle".
+  public func record(_ action: String) { send(["type": "record", "action": action]) }
+  /// Saves the next frame, full resolution, as a JPEG next to the recordings.
+  public func snapshot() { send(["type": "snapshot"]) }
   public func log(_ text: String) { send(["type": "log", "text": text]) }
 
   // MARK: Receiving
@@ -134,6 +165,7 @@ public final class PocketViewer {
       guard let payload = size > 0 ? readExact(size) : Data() else { return }
       switch h["type"] as? String {
       case "hello": onHello?(h)
+      case "input": onInput?(h)
       case "set":
         if let key = h["key"] as? String, let value = h["value"] { onSet?(key, value) }
       case "state":
