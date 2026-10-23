@@ -4,3 +4,5 @@ pocketctl
 *.dSYM/
 .DS_Store
 *.mov
+.openai-key
+plugins/bin/

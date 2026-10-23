@@ -1,0 +1,137 @@
+"""Client for pocket-viewer plugins. Standard library only.
+
+    import pocketviewer
+
+    class Hello(pocketviewer.Plugin):
+        def on_video(self, frame):           # frame.data: BGRA bytes, row 0 = top
+            self.draw("box", [{"shape": "rect", "x": .4, "y": .4, "w": .2, "h": .2}], ttl=1)
+
+    Hello("hello").run(video={"maxWidth": 320, "fps": 5})
+
+See ../PROTOCOL.md for the wire format.
+"""
+
+import json
+import os
+import socket
+import struct
+import tempfile
+import threading
+from dataclasses import dataclass
+
+
+def default_socket_path():
+    return os.environ.get("POCKET_VIEWER_SOCKET") or os.path.join(tempfile.gettempdir(), "pocket-viewer.sock")
+
+
+@dataclass
+class VideoFrame:
+    pts: float      # host-clock seconds
+    width: int
+    height: int
+    format: str     # "bgra" (rows top to bottom, 4 bytes per pixel) or "jpeg"
+    data: bytes
+
+
+@dataclass
+class AudioChunk:
+    pts: float
+    rate: int
+    channels: int
+    frames: int
+    data: bytes     # signed 16-bit little-endian, interleaved
+
+
+class Plugin:
+    """Subclass and override on_hello / on_video / on_audio / on_state."""
+
+    def __init__(self, name, socket_path=None):
+        self.name = name
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.connect(socket_path or default_socket_path())
+        self._send_lock = threading.Lock()
+        self.hello = {}
+        self.state = {}
+        self.send({"type": "hello", "name": name, "token": os.environ.get("POCKET_VIEWER_TOKEN", "")})
+
+    # --- sending -----------------------------------------------------------
+
+    def send(self, header, payload=b""):
+        if payload:
+            header = dict(header, size=len(payload))
+        body = json.dumps(header, separators=(",", ":")).encode()
+        with self._send_lock:
+            self.sock.sendall(struct.pack(">I", len(body)) + body + payload)
+
+    def subscribe(self, video=None, audio=None, state=False):
+        """video: {"maxWidth", "fps", "format": "bgra"|"jpeg", "quality"}; audio: {"rate", "channels"}."""
+        self.send({"type": "subscribe", "video": video, "audio": audio, "state": state})
+
+    def draw(self, layer, items, ttl=0):
+        """Replace this plugin's `layer` with `items`; it disappears after `ttl` seconds (0 = keep)."""
+        self.send({"type": "draw", "layer": layer, "items": items, "ttl": ttl})
+
+    def clear(self, layer=None):
+        self.send({"type": "clear", "layer": layer} if layer else {"type": "clear"})
+
+    def gimbal(self, pan=None, tilt=None, dpan=None, dtilt=None):
+        msg = {"type": "gimbal"}
+        for k, v in (("pan", pan), ("tilt", tilt), ("dpan", dpan), ("dtilt", dtilt)):
+            if v is not None:
+                msg[k] = v
+        self.send(msg)
+
+    def zoom(self, zoom=None, dzoom=None):
+        self.send({"type": "zoom", **({"zoom": zoom} if zoom is not None else {"dzoom": dzoom or 0})})
+
+    def roll(self, roll=None, droll=None):
+        self.send({"type": "roll", **({"roll": roll} if roll is not None else {"droll": droll or 0})})
+
+    def center(self):
+        self.send({"type": "center"})
+
+    def log(self, text):
+        self.send({"type": "log", "text": str(text)})
+
+    # --- receiving ---------------------------------------------------------
+
+    def on_hello(self, hello): pass
+    def on_video(self, frame: VideoFrame): pass
+    def on_audio(self, chunk: AudioChunk): pass
+    def on_state(self, state): pass
+
+    def _read_exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("pocket-viewer closed the connection")
+            buf += chunk
+        return bytes(buf)
+
+    def receive(self):
+        """Read one message; returns (header, payload)."""
+        (hlen,) = struct.unpack(">I", self._read_exact(4))
+        header = json.loads(self._read_exact(hlen))
+        payload = self._read_exact(header["size"]) if header.get("size") else b""
+        return header, payload
+
+    def run(self, video=None, audio=None, state=False):
+        """Subscribe and dispatch messages until pocket-viewer goes away."""
+        self.subscribe(video=video, audio=audio, state=state)
+        try:
+            while True:
+                h, payload = self.receive()
+                t = h.get("type")
+                if t == "hello":
+                    self.hello = h
+                    self.on_hello(h)
+                elif t == "video":
+                    self.on_video(VideoFrame(h["pts"], h["width"], h["height"], h["format"], payload))
+                elif t == "audio":
+                    self.on_audio(AudioChunk(h["pts"], int(h["rate"]), h["channels"], h["frames"], payload))
+                elif t == "state":
+                    self.state = h
+                    self.on_state(h)
+        except (ConnectionError, BrokenPipeError):
+            pass

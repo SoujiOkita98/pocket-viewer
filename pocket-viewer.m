@@ -9,7 +9,7 @@
 //   v                   video scaling: fill (crop) / fit (letterbox) / stretch
 //   ⌘1..⌘9              switch resolution (also in the Resolution / Frame Rate menus)
 //
-// Usage: pocket-viewer [-s WxH] [-r fps] [-a audio] [-o dir] [-c codec] [-e] [-t secs] [-l]
+// Usage: pocket-viewer [-s WxH] [-r fps] [-a audio] [-o dir] [-c codec] [-e] [-p cmd]... [-t secs] [-l]
 //   -s WxH   initial resolution, e.g. 3840x2160 or 1080x1920 (portrait); default 1920x1080
 //   -r fps   initial frame rate; default the highest the resolution supports
 //   -a name  audio input to use (substring of its name, e.g. AG06); default the Pocket 3 mic.
@@ -18,6 +18,7 @@
 //   -c codec recording video codec: hevc, h264 or prores; default the Record menu choice (hevc)
 //   -e       start with echo cancellation on (experimental)
 //   -t secs  record immediately for secs seconds, then quit
+//   -p cmd   launch a plugin (shell command); repeatable. See plugins/PROTOCOL.md
 //   -l       list available resolutions, frame rates and audio inputs, then exit
 
 #import <AVFoundation/AVFoundation.h>
@@ -27,10 +28,185 @@
 #include "gimbal.h"
 #import "echocancel.h"
 #import "moviewriter.h"
+#import "plugins.h"
 
 static NSString *const kDeviceName = @"OsmoPocket3";
 
 static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > hi ? hi : x; }
+
+// Draws what plugins send (boxes, lines, labels, subtitles) over the video.
+// Coordinates are normalized to the video frame, origin top-left, and follow
+// the preview's scaling mode. Each plugin layer is replaced wholesale by its
+// next draw and can expire on its own (ttl).
+@interface OverlayView : NSView
+@property(nonatomic, weak) AVCaptureVideoPreviewLayer *preview;
+@property(nonatomic) CGSize videoSize;
+- (void)setItems:(NSArray *)items forKey:(NSString *)key ttl:(double)ttl;
+- (void)removeKeysWithPrefix:(NSString *)prefix;
+- (void)keepClients:(NSSet<NSNumber *> *)clientIDs;  // drops layers of disconnected plugins
+@end
+
+static NSColor *colorFromHex(id value, NSColor *fallback) {
+  if (![value isKindOfClass:NSString.class] || ![value hasPrefix:@"#"]) return fallback;
+  unsigned v = 0;
+  NSString *hex = [value substringFromIndex:1];
+  if (![[NSScanner scannerWithString:hex] scanHexInt:&v]) return fallback;
+  if (hex.length == 6) v = (v << 8) | 0xff;
+  else if (hex.length != 8) return fallback;
+  return [NSColor colorWithSRGBRed:(v >> 24 & 0xff) / 255.0
+                             green:(v >> 16 & 0xff) / 255.0
+                              blue:(v >> 8 & 0xff) / 255.0
+                             alpha:(v & 0xff) / 255.0];
+}
+
+static double num(NSDictionary *d, NSString *key, double fallback) {
+  id v = d[key];
+  return [v isKindOfClass:NSNumber.class] ? [v doubleValue] : fallback;
+}
+
+@implementation OverlayView {
+  NSMutableDictionary<NSString *, NSDictionary *> *_layers;  // key -> {items, expires}
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  if ((self = [super initWithFrame:frame])) {
+    _layers = [NSMutableDictionary dictionary];
+    [NSTimer scheduledTimerWithTimeInterval:0.1 target:self selector:@selector(expire) userInfo:nil repeats:YES];
+  }
+  return self;
+}
+
+- (NSView *)hitTest:(NSPoint)point {
+  return nil;  // never steal clicks, drags or the right-click menu from the video view
+}
+
+- (void)setItems:(NSArray *)items forKey:(NSString *)key ttl:(double)ttl {
+  _layers[key] = @{@"items" : items, @"expires" : @(ttl > 0 ? CACurrentMediaTime() + ttl : INFINITY)};
+  self.needsDisplay = YES;
+}
+
+- (void)removeKeysWithPrefix:(NSString *)prefix {
+  for (NSString *key in _layers.allKeys)
+    if ([key hasPrefix:prefix]) [_layers removeObjectForKey:key];
+  self.needsDisplay = YES;
+}
+
+- (void)keepClients:(NSSet<NSNumber *> *)clientIDs {
+  for (NSString *key in _layers.allKeys)
+    if (![clientIDs containsObject:@(key.intValue)]) [_layers removeObjectForKey:key];
+  self.needsDisplay = YES;
+}
+
+- (void)expire {
+  double now = CACurrentMediaTime();
+  for (NSString *key in _layers.allKeys)
+    if ([_layers[key][@"expires"] doubleValue] < now) {
+      [_layers removeObjectForKey:key];
+      self.needsDisplay = YES;
+    }
+}
+
+// Where the video lands in this view under the preview's current scaling.
+- (NSRect)videoRect {
+  NSRect b = self.bounds;
+  CGSize v = self.videoSize;
+  NSString *gravity = self.preview.videoGravity;
+  if (v.width <= 0 || v.height <= 0 || [gravity isEqual:AVLayerVideoGravityResize]) return b;
+  double sx = b.size.width / v.width, sy = b.size.height / v.height;
+  double scale = [gravity isEqual:AVLayerVideoGravityResizeAspectFill] ? MAX(sx, sy) : MIN(sx, sy);
+  double w = v.width * scale, h = v.height * scale;
+  return NSMakeRect(NSMidX(b) - w / 2, NSMidY(b) - h / 2, w, h);
+}
+
+static void drawLabel(NSString *text, NSPoint origin, double size, NSColor *color, NSColor *background) {
+  NSDictionary *attrs = @{
+    NSFontAttributeName : [NSFont systemFontOfSize:size weight:NSFontWeightSemibold],
+    NSForegroundColorAttributeName : color
+  };
+  NSSize sz = [text sizeWithAttributes:attrs];
+  NSRect box = NSMakeRect(origin.x, origin.y, sz.width + 8, sz.height + 4);
+  if (background) {
+    [background setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:box xRadius:3 yRadius:3] fill];
+  }
+  [text drawAtPoint:NSMakePoint(origin.x + 4, origin.y + 2) withAttributes:attrs];
+}
+
+- (void)drawRect:(NSRect)dirty {
+  NSRect v = self.videoRect;
+  NSRect visible = NSIntersectionRect(v, self.bounds);
+  // Normalized (top-left origin) -> view (bottom-left origin).
+  NSPoint (^pt)(double, double) = ^NSPoint(double x, double y) {
+    return NSMakePoint(NSMinX(v) + x * v.size.width, NSMaxY(v) - y * v.size.height);
+  };
+  NSMutableArray<NSDictionary *> *subtitles = [NSMutableArray array];
+
+  for (NSString *key in [_layers.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+    for (NSDictionary *item in _layers[key][@"items"]) {
+      if (![item isKindOfClass:NSDictionary.class]) continue;
+      NSString *shape = item[@"shape"];
+      NSColor *color = colorFromHex(item[@"color"], NSColor.systemGreenColor);
+      double width = num(item, @"width", 2);
+      if ([shape isEqual:@"rect"]) {
+        NSPoint tl = pt(num(item, @"x", 0), num(item, @"y", 0));
+        NSPoint br = pt(num(item, @"x", 0) + num(item, @"w", 0), num(item, @"y", 0) + num(item, @"h", 0));
+        NSRect r = NSMakeRect(tl.x, br.y, br.x - tl.x, tl.y - br.y);
+        NSColor *fill = colorFromHex(item[@"fill"], nil);
+        if (fill) {
+          [fill setFill];
+          NSRectFillUsingOperation(r, NSCompositingOperationSourceOver);
+        }
+        NSBezierPath *path = [NSBezierPath bezierPathWithRect:r];
+        path.lineWidth = width;
+        [color setStroke];
+        [path stroke];
+        if ([item[@"label"] isKindOfClass:NSString.class])
+          drawLabel(item[@"label"], NSMakePoint(r.origin.x - width / 2, NSMaxY(r) + width / 2),
+                    num(item, @"size", 13), NSColor.blackColor, color);
+      } else if ([shape isEqual:@"line"]) {
+        NSBezierPath *path = [NSBezierPath bezierPath];
+        [path moveToPoint:pt(num(item, @"x1", 0), num(item, @"y1", 0))];
+        [path lineToPoint:pt(num(item, @"x2", 0), num(item, @"y2", 0))];
+        path.lineWidth = width;
+        [color setStroke];
+        [path stroke];
+      } else if ([shape isEqual:@"text"] && [item[@"text"] isKindOfClass:NSString.class]) {
+        double size = num(item, @"size", 15);
+        NSPoint p = pt(num(item, @"x", 0), num(item, @"y", 0));
+        drawLabel(item[@"text"], NSMakePoint(p.x, p.y - size - 6), size, colorFromHex(item[@"color"], NSColor.whiteColor),
+                  colorFromHex(item[@"background"], [NSColor colorWithWhite:0 alpha:0.55]));
+      } else if ([shape isEqual:@"subtitle"] && [item[@"text"] isKindOfClass:NSString.class]) {
+        [subtitles addObject:item];
+      }
+    }
+  }
+
+  // Subtitles stack upward from the bottom of the visible video, centered and wrapped.
+  double y = NSMinY(visible) + 24;
+  for (NSDictionary *item in subtitles.reverseObjectEnumerator) {
+    double size = num(item, @"size", 24);
+    NSMutableParagraphStyle *para = [NSMutableParagraphStyle new];
+    para.alignment = NSTextAlignmentCenter;
+    NSAttributedString *text = [[NSAttributedString alloc]
+        initWithString:item[@"text"]
+            attributes:@{
+              NSFontAttributeName : [NSFont systemFontOfSize:size weight:NSFontWeightMedium],
+              NSForegroundColorAttributeName : colorFromHex(item[@"color"], NSColor.whiteColor),
+              NSParagraphStyleAttributeName : para
+            }];
+    double maxWidth = visible.size.width * 0.9;
+    NSRect bounds = [text boundingRectWithSize:NSMakeSize(maxWidth, CGFLOAT_MAX)
+                                       options:NSStringDrawingUsesLineFragmentOrigin];
+    NSRect box = NSMakeRect(NSMidX(visible) - bounds.size.width / 2 - 12, y, bounds.size.width + 24,
+                            bounds.size.height + 12);
+    [colorFromHex(item[@"background"], [NSColor colorWithWhite:0 alpha:0.6]) setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:box xRadius:6 yRadius:6] fill];
+    [text drawWithRect:NSInsetRect(box, 12, 6) options:NSStringDrawingUsesLineFragmentOrigin];
+    y = NSMaxY(box) + 8;
+  }
+}
+
+@end
 
 @interface ControlView : NSView
 @property(nonatomic) AVCaptureSession *session;
@@ -43,7 +219,10 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
 @property(nonatomic) AVCaptureVideoPreviewLayer *preview;
 @property(nonatomic) NSDate *recordingSince;  // nil when not recording
 @property(nonatomic, copy) NSMenu * (^menuProvider)(void);  // right-click menu
+@property(nonatomic) OverlayView *overlay;
 - (void)fillGravityMenu:(NSMenu *)menu;
+- (void)handlePluginCommand:(NSDictionary *)msg;  // gimbal / zoom / roll / center
+- (NSDictionary *)gimbalState;
 @end
 
 @implementation ControlView {
@@ -55,6 +234,8 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
   double _zoomTarget, _zoomPos;  // smooth zoom: _zoomPos eases toward _zoomTarget
   NSTimer *_zoomTimer;
   BOOL _sendPending, _zoomSendPending;
+  double _actualPan, _actualTilt;  // read back from the camera every 0.2 s
+  double _lastCommand;             // CACurrentMediaTime of the last pan/tilt command
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -64,10 +245,18 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
     _hasGimbal = gimbal_open(&_range) == 0 && gimbal_get(&_pan, &_tilt) == 0 &&
                  gimbal_get_zoom(&_zoom) == 0 && gimbal_get_roll(&_roll) == 0;
     _zoomTarget = _zoomPos = _zoom;
+    _actualPan = _pan;
+    _actualTilt = _tilt;
+    if (_hasGimbal)
+      [NSTimer scheduledTimerWithTimeInterval:0.2 target:self selector:@selector(pollActual) userInfo:nil repeats:YES];
     if (!_hasGimbal) NSLog(@"gimbal control unavailable");
 
     self.wantsLayer = YES;
     self.layer.backgroundColor = NSColor.blackColor.CGColor;
+
+    _overlay = [[OverlayView alloc] initWithFrame:self.bounds];
+    _overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [self addSubview:_overlay];  // below the HUD, above the video layer
 
     _hud = [NSTextField labelWithString:@""];
     _hud.font = [NSFont monospacedSystemFontOfSize:13 weight:NSFontWeightMedium];
@@ -120,6 +309,7 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
 // carries the latest target instead of a backlog.
 - (void)sendPosition {
   if (!_hasGimbal) return;
+  _lastCommand = CACurrentMediaTime();
   _pan = clampd(_pan, _range.pan_min, _range.pan_max);
   _tilt = clampd(_tilt, _range.tilt_min, _range.tilt_max);
   if (_sendPending) return;
@@ -216,6 +406,57 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
   [CATransaction commit];
 }
 
+// Reads where the gimbal really is. Once nothing has been commanded for a
+// while, a mismatch means something else moved it (pocketctl, the handle's own
+// follow behavior), so adopt the real position as the base for relative moves.
+- (void)pollActual {
+  dispatch_async(_gimbalQueue, ^{
+    double pan, tilt;
+    if (gimbal_get(&pan, &tilt)) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self->_actualPan = pan;
+      self->_actualTilt = tilt;
+      if (CACurrentMediaTime() - self->_lastCommand > 2 &&
+          (fabs(pan - self->_pan) > 1 || fabs(tilt - self->_tilt) > 1)) {
+        self->_pan = pan;
+        self->_tilt = tilt;
+      }
+    });
+  });
+}
+
+// Plugin commands. Absolute values win over relative ones in the same message.
+- (void)handlePluginCommand:(NSDictionary *)m {
+  NSString *type = m[@"type"];
+  if ([type isEqual:@"gimbal"]) {
+    _pan = num(m, @"pan", _pan + num(m, @"dpan", 0));
+    _tilt = num(m, @"tilt", _tilt + num(m, @"dtilt", 0));
+    [self sendPosition];
+  } else if ([type isEqual:@"zoom"]) {
+    [self setZoom:num(m, @"zoom", _zoomTarget + num(m, @"dzoom", 0))];
+  } else if ([type isEqual:@"roll"]) {
+    [self setRoll:num(m, @"roll", _roll + num(m, @"droll", 0))];
+  } else if ([type isEqual:@"center"]) {
+    [self centerGimbal:nil];
+  }
+}
+
+// pan/tilt are the commanded target; actualPan/actualTilt the last readback.
+- (NSDictionary *)gimbalState {
+  if (!_hasGimbal) return @{};
+  return @{
+    @"pan" : @(_pan),
+    @"tilt" : @(_tilt),
+    @"actualPan" : @(_actualPan),  // where the camera is now; lags pan/tilt while moving
+    @"actualTilt" : @(_actualTilt),
+    @"roll" : @(_roll),
+    @"zoom" : @(_zoomTarget),
+    @"panRange" : @[ @(_range.pan_min), @(_range.pan_max) ],
+    @"tiltRange" : @[ @(_range.tilt_min), @(_range.tilt_max) ],
+    @"zoomRange" : @[ @(_range.zoom_min), @(_range.zoom_max) ],
+  };
+}
+
 - (void)centerGimbal:(id)sender {
   _pan = 0;
   _tilt = 0;
@@ -284,19 +525,22 @@ static double clampd(double x, double lo, double hi) { return x < lo ? lo : x > 
 
 @interface AppDelegate
     : NSObject <NSApplicationDelegate, NSMenuDelegate, AVCaptureFileOutputRecordingDelegate,
-                AVCaptureVideoDataOutputSampleBufferDelegate>
+                AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate,
+                PluginServerDelegate>
+@property(nonatomic) PluginServer *plugins;
+@property(nonatomic) AVCaptureAudioDataOutput *audioData;  // feeds plugins in normal (non echo-cancel) mode
 @property(nonatomic) AVCaptureDevice *selectedAudio;  // what the user picked; may be routed via echo cancel
 @property(nonatomic, copy) NSString *monitorSetting, *lastMonitorOn;  // kDefaultsMonitor values
 @property(nonatomic) BOOL echoCancel;
 @property(nonatomic) EchoCanceller *ec;
 @property(nonatomic, copy) NSString *ecInputUID, *ecOutputUID;
-@property(nonatomic) AVCaptureVideoDataOutput *videoData;  // feeds the writer in echo-cancel mode
+@property(nonatomic) AVCaptureVideoDataOutput *videoData;  // feeds plugins, and the writer in echo-cancel mode
 @property(atomic) MovieWriter *writer;                     // read on the video and audio threads
 @property(nonatomic) BOOL finishingWriter;
 @property(nonatomic, readonly) BOOL isRecording;
 @property(nonatomic) AVCaptureAudioPreviewOutput *monitor;
 @property(nonatomic) AVCaptureDeviceInput *audioInput;
-@property(nonatomic) NSMenu *audioMenu, *outputMenu;
+@property(nonatomic) NSMenu *audioMenu, *outputMenu, *pluginsMenu;
 @property(nonatomic) AVCaptureMovieFileOutput *movieOutput;
 @property(nonatomic, copy) NSString *videoCodec, *audioFormat, *outputDir;
 @property(nonatomic) NSURL *lastRecording;
@@ -404,6 +648,7 @@ static NSString *fpsString(double fps) {
 static NSString *optSize, *optFps, *optOutDir, *optAudio, *optCodec;
 static double optRecordSecs;
 static BOOL optEchoCancel;
+static NSMutableArray<NSString *> *optPlugins;
 
 // {UID, name} of every CoreAudio device that has output streams. The UID is what
 // AVCaptureAudioPreviewOutput.outputDeviceUniqueID takes.
@@ -552,6 +797,31 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   self.monitorSetting = monitorChoice;
   self.echoCancel = optEchoCancel;
 
+  // Raw frames and audio for plugins (and video for the echo-cancel writer).
+  AVCaptureVideoDataOutput *videoData = [AVCaptureVideoDataOutput new];
+  videoData.alwaysDiscardsLateVideoFrames = NO;  // the writer needs every frame; plugins drop their own
+  [videoData setSampleBufferDelegate:self queue:dispatch_queue_create("video", DISPATCH_QUEUE_SERIAL)];
+  if ([session canAddOutput:videoData]) {
+    [session addOutput:videoData];
+    self.videoData = videoData;
+  }
+  AVCaptureAudioDataOutput *audioData = [AVCaptureAudioDataOutput new];
+  // One predictable format whatever the input: multichannel devices (e.g.
+  // BlackHole 64ch) are mixed to stereo here instead of in every consumer.
+  audioData.audioSettings = @{
+    AVFormatIDKey : @(kAudioFormatLinearPCM),
+    AVSampleRateKey : @48000,
+    AVNumberOfChannelsKey : @2,
+    AVLinearPCMBitDepthKey : @32,
+    AVLinearPCMIsFloatKey : @YES,
+    AVLinearPCMIsNonInterleaved : @NO,
+  };
+  [audioData setSampleBufferDelegate:self queue:dispatch_queue_create("audio", DISPATCH_QUEUE_SERIAL)];
+  if ([session canAddOutput:audioData]) {
+    [session addOutput:audioData];
+    self.audioData = audioData;
+  }
+
   AVCaptureMovieFileOutput *movie = [AVCaptureMovieFileOutput new];
   if ([session canAddOutput:movie]) {
     [session addOutput:movie];
@@ -577,6 +847,7 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   AVCaptureVideoPreviewLayer *preview = [AVCaptureVideoPreviewLayer layerWithSession:session];
   preview.videoGravity = AVLayerVideoGravityResizeAspectFill;
   view.preview = preview;
+  view.overlay.preview = preview;
   __weak AppDelegate *weakSelf = self;
   view.menuProvider = ^NSMenu * { return [weakSelf contextMenu]; };
   preview.frame = view.bounds;
@@ -620,6 +891,8 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
                                               usingBlock:^(NSNotification *n) {
     NSLog(@"capture session error: %@", n.userInfo[AVCaptureSessionErrorKey]);
   }];
+  [self startPlugins];
+
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
     [session startRunning];
     // Give the camera a moment to deliver frames; recording started before the
@@ -658,6 +931,7 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   self.size = size;
   self.fps = fps;
   self.view.formatInfo = [NSString stringWithFormat:@"%@@%@", sizeString(size), fpsString(fps)];
+  self.view.overlay.videoSize = CGSizeMake(size.width, size.height);
   if (orientationChanged) [self fitWindowToSize:size];
   [self updateMenus];
   return YES;
@@ -703,6 +977,10 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   self.outputMenu.delegate = self;
   [main addItemWithTitle:@"" action:nil keyEquivalent:@""].submenu = self.outputMenu;
 
+  self.pluginsMenu = [[NSMenu alloc] initWithTitle:@"Plugins"];
+  self.pluginsMenu.delegate = self;
+  [main addItemWithTitle:@"" action:nil keyEquivalent:@""].submenu = self.pluginsMenu;
+
   NSMenu *recordMenu = [[NSMenu alloc] initWithTitle:@"Record"];
   [self addRecordToggleTo:recordMenu];
   [recordMenu addItem:NSMenuItem.separatorItem];
@@ -723,6 +1001,8 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   [m addItem:NSMenuItem.separatorItem];
   [self fillAudioInputMenu:[self addSubmenu:@"Audio Input" to:m]];
   [self fillOutputMenu:[self addSubmenu:@"Audio Output (Monitor)" to:m]];
+  [m addItem:NSMenuItem.separatorItem];
+  [self fillPluginsMenu:[self addSubmenu:@"Plugins" to:m]];
   [m addItem:NSMenuItem.separatorItem];
   // Untargeted items go to the view / window through the responder chain.
   [self.view fillGravityMenu:[self addSubmenu:@"Video Scaling" to:m]];
@@ -863,18 +1143,6 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
       NSLog(@"audio input %@: %@", self.selectedAudio.localizedName, err.localizedDescription ?: @"cannot add");
     }
   }
-  if (ec && !self.videoData) {
-    AVCaptureVideoDataOutput *vd = [AVCaptureVideoDataOutput new];
-    vd.alwaysDiscardsLateVideoFrames = NO;  // recording: keep every frame
-    [vd setSampleBufferDelegate:self queue:dispatch_queue_create("video", DISPATCH_QUEUE_SERIAL)];
-    if ([self.session canAddOutput:vd]) {
-      [self.session addOutput:vd];
-      self.videoData = vd;
-    }
-  } else if (!ec && self.videoData) {
-    [self.session removeOutput:self.videoData];
-    self.videoData = nil;
-  }
   [self.session commitConfiguration];
   self.view.audioConnection = [self.monitor connectionWithMediaType:AVMediaTypeAudio];
   [self applyMonitor];
@@ -895,7 +1163,10 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
       if (!self.ec) {
         self.ec = [EchoCanceller new];
         __weak AppDelegate *weakSelf = self;
-        self.ec.onAudio = ^(CMSampleBufferRef buf) { [weakSelf.writer appendAudio:buf]; };
+        self.ec.onAudio = ^(CMSampleBufferRef buf) {
+          [weakSelf.writer appendAudio:buf];
+          [weakSelf.plugins pushAudio:buf];
+        };
       }
       NSError *err;
       if ([self.ec startWithInputUID:self.selectedAudio.uniqueID outputUID:outputUID monitoring:on error:&err]) {
@@ -941,6 +1212,8 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   [menu removeAllItems];
   if (menu == self.outputMenu)
     [self fillOutputMenu:menu];
+  else if (menu == self.pluginsMenu)
+    [self fillPluginsMenu:menu];
   else
     [self fillAudioInputMenu:menu];
 }
@@ -1098,25 +1371,32 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   }];
 }
 
-// Camera frames for the writer (echo-cancel mode only).
+// Camera frames and session audio. Everything handed on is restamped onto the
+// host clock, which the echo-cancelled audio already uses.
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)buffer
            fromConnection:(AVCaptureConnection *)connection {
-  MovieWriter *writer = self.writer;
-  if (!writer) return;
-  // The echo-cancelled audio is stamped on the host clock; bring video onto it.
+  MovieWriter *writer = output == self.videoData ? self.writer : nil;
+  if (!writer && !self.plugins) return;
+  CMSampleBufferRef hostTimed = NULL;
   CMTime pts = CMSampleBufferGetPresentationTimeStamp(buffer);
   CMTime host = CMSyncConvertTime(pts, self.session.synchronizationClock, CMClockGetHostTimeClock());
   if (CMTimeCompare(host, pts) == 0) {
-    [writer appendVideo:buffer];
-    return;
+    hostTimed = (CMSampleBufferRef)CFRetain(buffer);
+  } else {
+    CMSampleTimingInfo timing;
+    CMSampleBufferGetSampleTimingInfo(buffer, 0, &timing);
+    timing.presentationTimeStamp = host;
+    timing.decodeTimeStamp = kCMTimeInvalid;
+    if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, buffer, 1, &timing, &hostTimed)) return;
   }
-  CMSampleTimingInfo timing = {CMSampleBufferGetDuration(buffer), host, kCMTimeInvalid};
-  CMSampleBufferRef copy;
-  if (CMSampleBufferCreateCopyWithNewTiming(kCFAllocatorDefault, buffer, 1, &timing, &copy) == noErr) {
-    [writer appendVideo:copy];
-    CFRelease(copy);
+  if (output == self.videoData) {
+    [writer appendVideo:hostTimed];
+    [self.plugins pushVideo:hostTimed];
+  } else {
+    [self.plugins pushAudio:hostTimed];
   }
+  CFRelease(hostTimed);
 }
 
 - (void)recordingStarted:(NSURL *)url {
@@ -1172,6 +1452,124 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   return NSTerminateCancel;
 }
 
+#pragma mark Plugins
+
+- (void)startPlugins {
+  NSString *path = [NSTemporaryDirectory() stringByAppendingPathComponent:@"pocket-viewer.sock"];
+  self.plugins = [[PluginServer alloc] initWithSocketPath:path delegate:self];
+  NSError *err;
+  if (![self.plugins start:&err]) {
+    NSLog(@"plugin socket %@ unavailable: %@", path, err.localizedDescription);
+    self.plugins = nil;
+    return;
+  }
+  NSLog(@"plugin socket: %@", path);
+  for (NSString *cmd in optPlugins) [self.plugins launch:cmd];
+  // Gimbal state for plugins that asked for it (e.g. to close a tracking loop).
+  [NSTimer scheduledTimerWithTimeInterval:0.2
+                                  repeats:YES
+                                    block:^(NSTimer *t) {
+    [self.plugins broadcastState:self.pluginState];
+  }];
+}
+
+- (NSDictionary *)pluginState {
+  NSMutableDictionary *st = [self.view.gimbalState mutableCopy];
+  st[@"video"] = @{@"width" : @(self.size.width), @"height" : @(self.size.height), @"fps" : @(self.fps)};
+  st[@"recording"] = @(self.isRecording);
+  return st;
+}
+
+- (NSDictionary *)pluginHelloInfo {
+  return self.pluginState;
+}
+
+- (void)pluginClient:(PluginClient *)client sent:(NSDictionary *)msg {
+  NSString *type = msg[@"type"];
+  NSString *layer = [msg[@"layer"] isKindOfClass:NSString.class] ? msg[@"layer"] : @"default";
+  NSString *prefix = [NSString stringWithFormat:@"%d/", client.clientID];
+  if ([type isEqual:@"draw"]) {
+    NSArray *items = [msg[@"items"] isKindOfClass:NSArray.class] ? msg[@"items"] : @[];
+    [self.view.overlay setItems:items forKey:[prefix stringByAppendingString:layer] ttl:num(msg, @"ttl", 0)];
+  } else if ([type isEqual:@"clear"]) {
+    BOOL oneLayer = [msg[@"layer"] isKindOfClass:NSString.class];
+    [self.view.overlay removeKeysWithPrefix:oneLayer ? [prefix stringByAppendingString:layer] : prefix];
+  } else if ([type isEqual:@"gimbal"] || [type isEqual:@"zoom"] || [type isEqual:@"roll"] ||
+             [type isEqual:@"center"]) {
+    [self.view handlePluginCommand:msg];
+  } else if ([type isEqual:@"log"]) {
+    NSLog(@"[%@] %@", client.name, msg[@"text"]);
+  } else {
+    NSLog(@"[%@] unknown message type %@", client.name, type);
+  }
+}
+
+- (void)pluginClientsChanged {
+  NSMutableSet *ids = [NSMutableSet set];
+  for (PluginClient *c in self.plugins.clients) [ids addObject:@(c.clientID)];
+  [self.view.overlay keepClients:ids];
+}
+
+- (void)fillPluginsMenu:(NSMenu *)menu {
+  [menu addItemWithTitle:@"Load Plugin…" action:@selector(loadPlugin:) keyEquivalent:@""].target = self;
+  [menu addItem:NSMenuItem.separatorItem];
+  NSArray *clients = self.plugins.clients, *pending = self.plugins.pendingTasks;
+  for (PluginClient *c in clients) {
+    NSMenuItem *item = [menu addItemWithTitle:[NSString stringWithFormat:@"Stop “%@”%@", c.name,
+                                                                       c.task ? @"" : @" (external)"]
+                                       action:@selector(stopPlugin:)
+                                keyEquivalent:@""];
+    item.target = self;
+    item.representedObject = c;
+  }
+  for (NSTask *t in pending) {
+    NSMenuItem *item = [menu addItemWithTitle:[NSString stringWithFormat:@"Stop “%@” (starting)",
+                                                                       [self.plugins nameOfTask:t]]
+                                       action:@selector(stopPlugin:)
+                                keyEquivalent:@""];
+    item.target = self;
+    item.representedObject = t;
+  }
+  if (!clients.count && !pending.count) [menu addItemWithTitle:@"No plugins running" action:nil keyEquivalent:@""];
+  [menu addItem:NSMenuItem.separatorItem];
+  [menu addItemWithTitle:self.plugins ? [@"Socket: " stringByAppendingString:self.plugins.socketPath]
+                                      : @"Plugin socket unavailable"
+                  action:nil
+           keyEquivalent:@""];
+}
+
+static NSString *shellQuote(NSString *s) {
+  return [NSString stringWithFormat:@"'%@'", [s stringByReplacingOccurrencesOfString:@"'" withString:@"'\\''"]];
+}
+
+- (void)loadPlugin:(id)sender {
+  NSOpenPanel *panel = [NSOpenPanel openPanel];
+  panel.message = @"Choose a plugin: an executable, or a .py / .sh script";
+  panel.prompt = @"Load";
+  [panel beginSheetModalForWindow:self.window
+                completionHandler:^(NSModalResponse r) {
+    if (r != NSModalResponseOK) return;
+    NSString *path = panel.URL.path;
+    NSString *ext = path.pathExtension.lowercaseString;
+    NSString *cmd = [ext isEqual:@"py"]   ? [@"python3 " stringByAppendingString:shellQuote(path)]
+                    : [ext isEqual:@"sh"] ? [@"/bin/sh " stringByAppendingString:shellQuote(path)]
+                                          : shellQuote(path);
+    [self.plugins launch:cmd];
+  }];
+}
+
+- (void)stopPlugin:(NSMenuItem *)item {
+  id target = item.representedObject;
+  if ([target isKindOfClass:PluginClient.class])
+    [self.plugins stopClient:target];
+  else
+    [self.plugins stopTask:target];
+}
+
+- (void)applicationWillTerminate:(NSNotification *)note {
+  [self.plugins shutdown];
+}
+
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app {
   return YES;
 }
@@ -1200,7 +1598,7 @@ static void listFormats(void) {
 int main(int argc, char **argv) {
   @autoreleasepool {
     int opt;
-    while ((opt = getopt(argc, argv, "s:r:a:o:c:t:elh")) != -1) {
+    while ((opt = getopt(argc, argv, "s:r:a:o:c:t:p:elh")) != -1) {
       switch (opt) {
         case 's': optSize = @(optarg); break;
         case 'r': optFps = @(optarg); break;
@@ -1209,9 +1607,13 @@ int main(int argc, char **argv) {
         case 't': optRecordSecs = atof(optarg); break;
         case 'c': optCodec = @(optarg); break;
         case 'e': optEchoCancel = YES; break;
+        case 'p':
+          if (!optPlugins) optPlugins = [NSMutableArray array];
+          [optPlugins addObject:@(optarg)];
+          break;
         case 'l': listFormats(); return 0;
         default:
-          fprintf(stderr, "usage: pocket-viewer [-s WxH] [-r fps] [-a audio] [-o dir] [-c codec] [-e] [-t secs] [-l]\n");
+          fprintf(stderr, "usage: pocket-viewer [-s WxH] [-r fps] [-a audio] [-o dir] [-c codec] [-e] [-p cmd]... [-t secs] [-l]\n");
           return 2;
       }
     }

@@ -12,6 +12,7 @@ A small native macOS viewer, recorder and gimbal controller for the **DJI Osmo P
 - **Audio**: record from any input (the Pocket 3 mic, a USB audio interface, BlackHole, …) and monitor it on any output device.
 - **Recording** to `.mov` with HEVC, H.264 or ProRes 422 video and AAC or 24-bit PCM audio.
 - **Echo cancellation (experimental)**: uses macOS voice processing so that monitoring through speakers doesn't feed back into the mic.
+- **Plugins**: external programs in any language receive the video, the audio and the gimbal state over a local socket. They can draw boxes, labels and subtitles over the picture and steer the gimbal. Two examples are included: **face follow** and **live interpretation** (speech-to-subtitles plus translation).
 - Every option is available from the **right-click menu** and the menu bar.
 - `pocketctl`, a command-line gimbal controller.
 
@@ -24,7 +25,7 @@ A small native macOS viewer, recorder and gimbal controller for the **DJI Osmo P
 ## Build
 
 ```sh
-make            # builds ./pocket-viewer and ./pocketctl
+make            # builds ./pocket-viewer, ./pocketctl and the example plugins in plugins/bin/
 ```
 
 On first launch, macOS asks for camera and microphone access. If you run the app from a terminal, the permission is granted to that terminal.
@@ -46,6 +47,7 @@ On first launch, macOS asks for camera and microphone access. If you run the app
 | `-o dir` | where recordings go (default `~/Movies`) |
 | `-c codec` | `hevc`, `h264` or `prores` |
 | `-e` | start with echo cancellation on |
+| `-p cmd` | launch a plugin (repeatable) |
 | `-t secs` | record immediately for `secs` seconds, then quit |
 | `-l` | list formats and audio devices |
 
@@ -65,6 +67,31 @@ On first launch, macOS asks for camera and microphone access. If you run the app
 
 Recording settings, audio input and output, and echo cancellation are in the right-click menu and the menu bar.
 
+## Plugins
+
+A plugin is any program that connects to pocket-viewer's Unix socket. It subscribes to frames (BGRA or JPEG, at the size and rate it asks for), audio (16-bit PCM at the rate it asks for) and gimbal state. It sends back `draw` commands, which render as an overlay on the video, and `gimbal` / `zoom` commands. The wire format is in [plugins/PROTOCOL.md](plugins/PROTOCOL.md), with SDKs for [Python](plugins/python/pocketviewer.py) (standard library only) and [Swift](plugins/swift/PocketViewer.swift).
+
+```sh
+./pocket-viewer -p "plugins/bin/face-follow"                # keep the largest face framed
+./pocket-viewer -p "plugins/bin/interpreter --from zh-CN --to English"
+./pocket-viewer -p "python3 plugins/python/hello_overlay.py"
+```
+
+Plugins can also be loaded from *Plugins → Load Plugin…*, which also lists running plugins and stops them. A plugin started on its own, while pocket-viewer is running, connects to `$TMPDIR/pocket-viewer.sock`.
+
+```python
+import pocketviewer
+
+class Boxes(pocketviewer.Plugin):
+    def on_video(self, frame):            # frame.data: BGRA, rows top to bottom
+        self.draw("demo", [{"shape": "rect", "x": .4, "y": .4, "w": .2, "h": .2, "label": "hi"}], ttl=1)
+
+Boxes("boxes").run(video={"maxWidth": 320, "fps": 5})
+```
+
+- **face-follow** uses Apple Vision to box every face. It turns the gimbal to keep the largest one centered a little above the middle, and moves only once the gimbal has settled, so it converges without oscillating. Pass `--no-follow` to only draw.
+- **interpreter** recognizes speech on-device with Apple Speech and shows the phrase being spoken. At each pause it translates the phrase with the OpenAI API (`gpt-5.4-mini` by default) and shows the translation as a subtitle. Put your key in `$OPENAI_API_KEY` or a `.openai-key` file, which is git-ignored. On first run, macOS asks for speech-recognition permission.
+
 ## pocketctl
 
 ```sh
@@ -83,6 +110,7 @@ Recording settings, audio input and output, and echo cancellation are in the rig
 - **Not supported by the device.** Focus responds but ignores writes. Image controls (brightness, white balance, …) are stubs. A vendor extension unit exists but is undocumented and is left untouched.
 - **Video formats.** AVFoundation also lists `2vuy` formats for the Pocket 3, including the only 4K60 mode, but they deliver no frames on macOS. Only the `420v` formats are offered, which caps the frame rate at 4K30.
 - **Format locking.** macOS resets the camera format whenever the capture session reconfigures, unless the device stays locked for configuration. pocket-viewer holds that lock while it runs.
+- **Plugin direction and field of view.** +pan turns right and +tilt turns up. The field of view is about 95° × 53° at zoom 100 (16:9), measured by panning and cross-correlating frames through the plugin interface.
 - **Echo cancellation.** This uses `AVAudioEngine` with voice processing. It only cancels audio the engine itself plays, which is the monitor path, not other apps. Recording in this mode muxes camera frames and processed audio with `AVAssetWriter` on the host clock. See the comments in `echocancel.m` for the macOS voice-processing pitfalls worked around.
 
 ## License
