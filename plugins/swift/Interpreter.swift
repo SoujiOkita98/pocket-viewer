@@ -125,8 +125,15 @@ final class Recognizer {
   private var text = ""        // current task's transcript so far
   private var committed = ""   // the part of `text` already handed out as phrases
   private var lastChange = Date()
+  private var recent: [(time: Date, buffer: AVAudioPCMBuffer)] = []  // last few seconds of audio
   private let pause: Double
   var onPartial: ((String) -> Void)?
+  var onLog: ((String) -> Void)?
+
+  /// Errors that just mean "nothing was said" or "task was cancelled".
+  static func isQuiet(_ e: NSError) -> Bool {
+    (e.domain == "kAFAssistantErrorDomain" && [203, 216, 1110].contains(e.code)) || e.code == NSUserCancelledError
+  }
   var onPhrase: ((String) -> Void)?
 
   init?(locale: String, pause: Double) {
@@ -167,16 +174,51 @@ final class Recognizer {
         self.lock.unlock()
         if isCurrent { self.onPartial?(self.pendingText()) }
       }
-      if error != nil || result?.isFinal == true { self.restart(flush: self.request === req) }
+      // Only the current task may restart: cancelling the old one in restart()
+      // calls back here with an error, and restarting again then would kill
+      // the new task (which is how recognition used to stop after ~50 s).
+      guard error != nil || result?.isFinal == true else { return }
+      self.lock.lock()
+      let isCurrent = self.request === req
+      self.lock.unlock()
+      guard isCurrent else { return }
+      if let error = error as NSError?, !Recognizer.isQuiet(error) { self.onLog?("recognition: \(error.localizedDescription)") }
+      self.restart(flush: true)
     }
   }
 
-  /// Text not yet handed out. After a long pause the recognizer may start its
-  /// transcript over with just the new words, or it may revise words already
-  /// committed; either way only the common prefix still counts as committed.
+  /// Text not yet handed out. The recognizer may revise words it already
+  /// reported (punctuation, a better guess) or, after a long pause, start its
+  /// transcript over with just the new words. A mostly-shared prefix is a
+  /// revision: keep that much committed so it isn't translated twice. Little
+  /// in common means a new transcript: everything in it is new.
   private func pendingLocked() -> String {
-    if !text.hasPrefix(committed) { committed = String(text.commonPrefix(with: committed)) }
+    if !text.hasPrefix(committed) {
+      let common = text.commonPrefix(with: committed).count
+      if common * 2 < committed.count {
+        committed = ""
+      } else if let end = Recognizer.boundary(of: committed, in: text) {
+        committed = String(text[..<end])
+      } else {
+        committed = String(text.prefix(min(committed.count, text.count)))
+      }
+    }
     return String(text.dropFirst(committed.count))
+  }
+
+  /// Where the revised `text` reaches the end of what was `committed`: the
+  /// last occurrence of committed's final few characters near the old length.
+  /// Counting characters instead misplaces the boundary whenever the revision
+  /// added or removed punctuation, dropping or repeating words.
+  static func boundary(of committed: String, in text: String) -> String.Index? {
+    let anchor = String(committed.filter { !$0.isPunctuation && !$0.isWhitespace }.suffix(3))
+    guard !anchor.isEmpty else { return nil }
+    let limit = text.index(text.startIndex, offsetBy: min(text.count, committed.count + 6))
+    guard let r = text.range(of: anchor, options: .backwards, range: text.startIndex..<limit) else { return nil }
+    // Include punctuation that directly follows the anchor in the committed part.
+    var end = r.upperBound
+    while end < text.endIndex, text[end].isPunctuation { end = text.index(after: end) }
+    return end
   }
 
   private func pendingText() -> String {
@@ -197,11 +239,18 @@ final class Recognizer {
     if flush { flushPhrase() }
     lock.lock()
     let old = task
+    let heardUntil = lastChange
     request?.endAudio()
     request = nil
     lock.unlock()
     old?.cancel()
     startTask()
+    // The old task stops listening a moment after its last word, often once
+    // the next phrase has begun. Replay what came in after its last result so
+    // the new task hears that start too (it would otherwise lose a word or two).
+    lock.lock()
+    for (time, buffer) in recent where time > heardUntil { request?.append(buffer) }
+    lock.unlock()
   }
 
   private func tick() {
@@ -225,6 +274,9 @@ final class Recognizer {
     }
     lock.lock()
     request?.append(buf)
+    let now = Date()
+    recent.append((now, buf))
+    recent.removeAll { now.timeIntervalSince($0.time) > 5 }
     lock.unlock()
   }
 }
@@ -278,6 +330,7 @@ struct Interpreter {
       pv.log("speech recognition unavailable for \(opt.from)")
       exit(1)
     }
+    rec.onLog = { pv.log($0) }
     let translator = openAIKey(file: opt.keyFile).map { Translator(key: $0, options: opt) }
     pv.log("listening (\(opt.from), \(rec.onDevice ? "on-device" : "server-based") recognition) → "
       + (translator.map { _ in "\(opt.to) via \(opt.model)" } ?? "no OpenAI key found, transcript only"))
