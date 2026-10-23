@@ -1,0 +1,6 @@
+pocket-viewer
+pocketctl
+*.o
+*.dSYM/
+.DS_Store
+*.mov

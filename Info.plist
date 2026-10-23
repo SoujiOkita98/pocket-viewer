@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>io.github.c4pt0r.pocket-viewer</string>
+  <key>CFBundleName</key><string>pocket-viewer</string>
+  <key>NSCameraUsageDescription</key><string>Show live video from the DJI Pocket 3.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Monitor audio from the DJI Pocket 3.</string>
+</dict>
+</plist>
