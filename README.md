@@ -77,7 +77,7 @@ A plugin is any program that connects to pocket-viewer's Unix socket. It subscri
 ./pocket-viewer -p "python3 plugins/python/hello_overlay.py"
 ```
 
-Plugins can also be loaded from *Plugins → Load Plugin…*, which also lists running plugins and stops them. A plugin started on its own, while pocket-viewer is running, connects to `$TMPDIR/pocket-viewer.sock`.
+Plugins can also be loaded from *Plugins → Load Plugin…*. The same menu lists running plugins, shows each plugin's own settings (for example the interpreter's engine and target language, or face-follow's on/off), and stops plugins. Settings are remembered per plugin. A plugin started on its own, while pocket-viewer is running, connects to `$TMPDIR/pocket-viewer.sock`.
 
 ```python
 import pocketviewer
@@ -92,7 +92,7 @@ Boxes("boxes").run(video={"maxWidth": 320, "fps": 5})
 - **face-follow** uses Apple Vision to box every face. It turns the gimbal to keep the largest one centered a little above the middle, and moves only once the gimbal has settled, so it converges without oscillating. Pass `--no-follow` to only draw.
 - **interpreter** shows live subtitles with one of two engines:
   - `--asr apple` (the default): speech is recognized on-device with Apple Speech, and each phrase is translated with the OpenAI API (`gpt-5.4-mini`) once the speaker pauses. On first run, macOS asks for speech-recognition permission.
-  - `--asr openai`: the audio streams to OpenAI's `gpt-realtime-translate`, which transcribes and translates while the speaker is still talking. It is noticeably more accurate, and audio is uploaded continuously and billed per minute.
+  - `--asr openai`: the audio streams to OpenAI's `gpt-realtime-translate`, which transcribes and translates while the speaker is still talking. It is noticeably more accurate. It is billed per minute, so the session runs only while someone talks. A local voice detector opens it, and the last second of audio is replayed so no words are lost. It closes after 10 s without a transcript from OpenAI (`--idle`), so fans, music or typing don't keep it open. A session that heard only noise teaches the detector that noise level.
 
   Put your key in `$OPENAI_API_KEY` or a `.openai-key` file, which is git-ignored.
 

@@ -102,6 +102,7 @@ static BOOL writeAll(int fd, const uint8_t *p, size_t n) {
   dispatch_queue_t _ioQueue, _videoQueue, _audioQueue;
   NSMutableArray<PluginClient *> *_clients;          // main thread
   NSMutableDictionary<NSString *, NSTask *> *_pending;  // token -> task, main thread
+  NSMutableDictionary<NSString *, NSTask *> *_launched; // token -> task once connected
   NSMapTable<NSTask *, NSString *> *_taskNames;
   NSArray<PluginClient *> *_snapshot;                 // atomic copy for push threads
   int _nextID;
@@ -120,6 +121,7 @@ static BOOL writeAll(int fd, const uint8_t *p, size_t n) {
     _audioQueue = dispatch_queue_create("plugins.audio", DISPATCH_QUEUE_SERIAL);
     _clients = [NSMutableArray array];
     _pending = [NSMutableDictionary dictionary];
+    _launched = [NSMutableDictionary dictionary];
     _taskNames = [NSMapTable strongToStrongObjectsMapTable];
     _snapshot = @[];
     _ci = [CIContext contextWithOptions:nil];
@@ -274,9 +276,12 @@ static BOOL writeAll(int fd, const uint8_t *p, size_t n) {
   if ([type isEqual:@"hello"]) {
     if ([msg[@"name"] isKindOfClass:NSString.class]) c.name = msg[@"name"];
     NSString *token = [msg[@"token"] isKindOfClass:NSString.class] ? msg[@"token"] : @"";
-    NSTask *task = _pending[token];
+    NSTask *task = _pending[token] ?: _launched[token];
     if (task) {
       c.task = task;
+      // Remember it: a plugin that re-execs itself (to apply settings)
+      // reconnects with the same token and is still ours.
+      _launched[token] = task;
       [_pending removeObjectForKey:token];
     }
     NSLog(@"plugin connected: %@", c.name);
@@ -309,6 +314,7 @@ static BOOL writeAll(int fd, const uint8_t *p, size_t n) {
       if (!s) return;
       NSLog(@"plugin exited (%d): %@", t.terminationStatus, [s->_taskNames objectForKey:t]);
       [s->_pending removeObjectForKey:token];
+      [s->_launched removeObjectForKey:token];
       [s->_taskNames removeObjectForKey:t];
       [s publishClients];
     });
@@ -489,6 +495,10 @@ static AVAudioPCMBuffer *pcmFromSampleBuffer(CMSampleBufferRef sb) {
         payload:data
            done:^{ atomic_fetch_sub(&c->_audioInFlight, 1); }];
   }
+}
+
+- (void)send:(NSDictionary *)message to:(PluginClient *)client {
+  [client send:message payload:nil done:nil];
 }
 
 - (void)broadcastState:(NSDictionary *)state {

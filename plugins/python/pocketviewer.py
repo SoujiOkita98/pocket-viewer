@@ -90,6 +90,13 @@ class Plugin:
     def center(self):
         self.send({"type": "center"})
 
+    def set_options(self, items):
+        """Declare settings for pocket-viewer's Plugins menu, e.g.
+        {"key": "follow", "title": "Follow", "type": "bool", "value": True} or
+        {"key": "to", "title": "Translate to", "type": "choice", "choices": [["en", "English"]], "value": "en"}.
+        Changes arrive in on_set; send again whenever values change."""
+        self.send({"type": "options", "items": items})
+
     def log(self, text):
         self.send({"type": "log", "text": str(text)})
 
@@ -99,6 +106,7 @@ class Plugin:
     def on_video(self, frame: VideoFrame): pass
     def on_audio(self, chunk: AudioChunk): pass
     def on_state(self, state): pass
+    def on_set(self, key, value): pass
 
     def _read_exact(self, n):
         buf = bytearray()
@@ -130,6 +138,8 @@ class Plugin:
                     self.on_video(VideoFrame(h["pts"], h["width"], h["height"], h["format"], payload))
                 elif t == "audio":
                     self.on_audio(AudioChunk(h["pts"], int(h["rate"]), h["channels"], h["frames"], payload))
+                elif t == "set":
+                    self.on_set(h.get("key"), h.get("value"))
                 elif t == "state":
                     self.state = h
                     self.on_state(h)

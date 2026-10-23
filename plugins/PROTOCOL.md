@@ -25,6 +25,7 @@ pocket-viewer validates everything it receives. Malformed input, unknown types a
 | `hello` | `protocol` (1), `clientID`, plus the `state` fields below | — |
 | `video` | `pts` (host-clock seconds), `width`, `height`, `format` | `bgra`: width×height×4 bytes, rows top to bottom. `jpeg`: a JPEG |
 | `audio` | `pts`, `rate`, `channels`, `frames`, `format` (`s16le`) | interleaved signed 16-bit little-endian samples |
+| `set` | `key`, `value` | — the user changed a setting declared with `options` |
 | `state` | `pan`, `tilt`, `roll`, `zoom` (commanded); `actualPan`, `actualTilt` (read back from the camera); `panRange`, `tiltRange`, `zoomRange`; `video` {`width`, `height`, `fps`}; `recording` | — |
 
 `state` arrives every 0.2 s while subscribed. All timestamps share the host clock, so video and audio `pts` can be compared directly.
@@ -76,6 +77,18 @@ Each part is optional: `null`, `false` or a missing key unsubscribes, and `true`
 - **Speed:** the gimbal moves at roughly 8°/s. For closed-loop control, such as following a subject, wait until `actualPan`/`actualTilt` reach `pan`/`tilt` before acting on the next frame. A frame taken mid-move shows an error that is already being corrected, and correcting it again overshoots. [`FaceFollow.swift`](swift/FaceFollow.swift) does this.
 - **Field of view:** about 95° × 53° at zoom 100 in 16:9, divided by zoom/100.
 - **Zoom** changes glide smoothly to the target.
+
+### `options` (settings in the Plugins menu)
+```json
+{"type": "options", "items": [
+  {"key": "follow", "title": "Move the gimbal to follow", "type": "bool", "value": true},
+  {"key": "to", "title": "Translate to", "type": "choice", "value": "English",
+   "choices": [["English", "English"], ["Japanese", "日本語"]]}
+]}
+```
+- **Menu:** the items appear under *Plugins → (plugin name)*, in the right-click menu and the menu bar. A `bool` is a checkmark item; a `choice` is a submenu of `[value, label]` pairs, where `value` is a string or a number.
+- **Changes:** when the user changes a setting, pocket-viewer sends `{"type": "set", "key": …, "value": …}`. Apply it, then send `options` again with the new values.
+- **Saved values:** pocket-viewer remembers choices per plugin name. When a plugin first declares its options with different values, pocket-viewer sends `set` for each saved value that is still valid. A plugin may re-exec itself to apply a setting, as `interpreter` does; it keeps its identity through `POCKET_VIEWER_TOKEN`.
 
 ### `log`
 `{"type": "log", "text": "…"}` is written to pocket-viewer's log, prefixed with the plugin name.

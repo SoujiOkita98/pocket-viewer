@@ -59,7 +59,7 @@ func detectFaces(_ frame: VideoFrame) -> [(rect: CGRect, confidence: Float)] {
 @main
 struct FaceFollow {
   static func main() {
-    let opt = Options(CommandLine.arguments)
+    var opt = Options(CommandLine.arguments)
     let pv: PocketViewer
     do {
       pv = try PocketViewer(name: "face-follow")
@@ -125,6 +125,29 @@ struct FaceFollow {
       }
       settledSince = nil
     }
+
+    // Settings in pocket-viewer's Plugins menu; they apply immediately.
+    func declareOptions() {
+      pv.setOptions([
+        ["key": "follow", "title": "Move the gimbal to follow", "type": "bool", "value": opt.follow],
+        ["key": "gain", "title": "Correction per move", "type": "choice", "value": opt.gain,
+         "choices": [[0.5, "Gentle (50%)"], [0.8, "Normal (80%)"], [1.0, "Full (100%)"]]],
+        ["key": "targetY", "title": "Keep the face at", "type": "choice", "value": opt.targetY,
+         "choices": [[0.33, "Upper third"], [0.4, "Slightly above center"], [0.5, "Center"]]],
+      ])
+    }
+    pv.onSet = { key, value in
+      switch (key, value) {
+      case ("follow", let v as Bool): opt.follow = v
+      case ("gain", let v as Double): opt.gain = v
+      case ("targetY", let v as Double): opt.targetY = v
+      default: return
+      }
+      settledSince = nil
+      pv.log("\(key) → \(value)")
+      declareOptions()
+    }
+    declareOptions()
 
     pv.subscribe(video: ["maxWidth": 640, "fps": 15, "format": "bgra"], state: true)
     pv.log("face-follow started (follow: \(opt.follow), gain \(opt.gain))")

@@ -11,6 +11,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property(readonly) int clientID;
 @property(readonly, copy) NSString *name;   // from the plugin's hello, else "client N"
 @property(readonly, nullable) NSTask *task;  // set when pocket-viewer launched it
+// Settings the plugin declared with an "options" message (validated), for the
+// Plugins menu. Main thread.
+@property(nonatomic, copy, nullable) NSArray<NSDictionary *> *options;
 @end
 
 @protocol PluginServerDelegate <NSObject>
@@ -43,6 +46,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)pushVideo:(CMSampleBufferRef)buffer;
 - (void)pushAudio:(CMSampleBufferRef)buffer;
 - (void)broadcastState:(NSDictionary *)state;  // to clients subscribed to "state"
+- (void)send:(NSDictionary *)message to:(PluginClient *)client;
 
 @end
 

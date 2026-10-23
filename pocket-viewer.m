@@ -689,6 +689,7 @@ static NSString *const kDefaultsAudioFormat = @"audioFormat";
 static NSString *const kDefaultsOutputDir = @"outputDir";
 // "off", "default" (system output) or a CoreAudio device UID.
 static NSString *const kDefaultsMonitor = @"monitorOutput";
+static NSString *const kDefaultsPluginSettings = @"pluginSettings";  // plugin name -> {key: value}
 
 static NSArray<NSArray<NSString *> *> *videoCodecChoices(void) {
   return @[ @[ @"hevc", @"HEVC (H.265)" ], @[ @"h264", @"H.264" ], @[ @"prores", @"Apple ProRes 422" ] ];
@@ -1497,6 +1498,8 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   } else if ([type isEqual:@"gimbal"] || [type isEqual:@"zoom"] || [type isEqual:@"roll"] ||
              [type isEqual:@"center"]) {
     [self.view handlePluginCommand:msg];
+  } else if ([type isEqual:@"options"]) {
+    [self plugin:client declaredOptions:msg[@"items"]];
   } else if ([type isEqual:@"log"]) {
     NSLog(@"[%@] %@", client.name, msg[@"text"]);
   } else {
@@ -1515,12 +1518,20 @@ static NSString *titleForKey(NSArray<NSArray<NSString *> *> *choices, NSString *
   [menu addItem:NSMenuItem.separatorItem];
   NSArray *clients = self.plugins.clients, *pending = self.plugins.pendingTasks;
   for (PluginClient *c in clients) {
-    NSMenuItem *item = [menu addItemWithTitle:[NSString stringWithFormat:@"Stop “%@”%@", c.name,
-                                                                       c.task ? @"" : @" (external)"]
-                                       action:@selector(stopPlugin:)
-                                keyEquivalent:@""];
-    item.target = self;
-    item.representedObject = c;
+    NSString *stopTitle = [NSString stringWithFormat:@"Stop “%@”%@", c.name, c.task ? @"" : @" (external)"];
+    if (!c.options.count) {
+      NSMenuItem *item = [menu addItemWithTitle:stopTitle action:@selector(stopPlugin:) keyEquivalent:@""];
+      item.target = self;
+      item.representedObject = c;
+      continue;
+    }
+    // A plugin with settings gets its own submenu: settings, then Stop.
+    NSMenu *sub = [self addSubmenu:c.name to:menu];
+    [self fillOptions:c.options of:c into:sub];
+    [sub addItem:NSMenuItem.separatorItem];
+    NSMenuItem *stop = [sub addItemWithTitle:stopTitle action:@selector(stopPlugin:) keyEquivalent:@""];
+    stop.target = self;
+    stop.representedObject = c;
   }
   for (NSTask *t in pending) {
     NSMenuItem *item = [menu addItemWithTitle:[NSString stringWithFormat:@"Stop “%@” (starting)",
@@ -1556,6 +1567,105 @@ static NSString *shellQuote(NSString *s) {
                                           : shellQuote(path);
     [self.plugins launch:cmd];
   }];
+}
+
+#pragma mark Plugin settings
+
+// Keeps only well-formed items: {key, title, type: bool} or
+// {key, title, type: choice, choices: [[value, label], ...]}, plus a value.
+static NSArray<NSDictionary *> *validOptions(id items) {
+  if (![items isKindOfClass:NSArray.class]) return @[];
+  NSMutableArray *out = [NSMutableArray array];
+  for (NSDictionary *o in items) {
+    if (![o isKindOfClass:NSDictionary.class] || ![o[@"key"] isKindOfClass:NSString.class] ||
+        ![o[@"title"] isKindOfClass:NSString.class])
+      continue;
+    if ([o[@"type"] isEqual:@"bool"]) {
+      [out addObject:@{@"key" : o[@"key"], @"title" : o[@"title"], @"type" : @"bool",
+                       @"value" : @([o[@"value"] isKindOfClass:NSNumber.class] && [o[@"value"] boolValue])}];
+    } else if ([o[@"type"] isEqual:@"choice"] && [o[@"choices"] isKindOfClass:NSArray.class]) {
+      NSMutableArray *choices = [NSMutableArray array];
+      for (NSArray *c in o[@"choices"])
+        if ([c isKindOfClass:NSArray.class] && c.count == 2 && [c[1] isKindOfClass:NSString.class] &&
+            ([c[0] isKindOfClass:NSString.class] || [c[0] isKindOfClass:NSNumber.class]))
+          [choices addObject:c];
+      if (choices.count)
+        [out addObject:@{@"key" : o[@"key"], @"title" : o[@"title"], @"type" : @"choice", @"choices" : choices,
+                         @"value" : o[@"value"] ?: NSNull.null}];
+    }
+  }
+  return out;
+}
+
+- (NSMutableDictionary *)savedSettingsFor:(NSString *)plugin {
+  NSDictionary *all = [NSUserDefaults.standardUserDefaults dictionaryForKey:kDefaultsPluginSettings];
+  return [all[plugin] isKindOfClass:NSDictionary.class] ? [all[plugin] mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+- (void)plugin:(PluginClient *)client declaredOptions:(id)items {
+  NSArray *options = validOptions(items);
+  // Restore what the user chose last time, if the plugin reports otherwise.
+  // Only on its first declaration: later ones echo changes still in flight.
+  BOOL first = client.options == nil;
+  NSDictionary *saved = first ? [self savedSettingsFor:client.name] : @{};
+  NSMutableArray *restored = [NSMutableArray array];
+  for (NSDictionary *o in options) {
+    id want = saved[o[@"key"]];
+    // Saved values must still fit: plugins change their choices over time.
+    BOOL fits = [o[@"type"] isEqual:@"bool"] && [want isKindOfClass:NSNumber.class];
+    for (NSArray *c in o[@"choices"]) fits = fits || [c[0] isEqual:want];
+    if (want && fits && ![want isEqual:o[@"value"]]) {
+      [self.plugins send:@{@"type" : @"set", @"key" : o[@"key"], @"value" : want} to:client];
+      NSMutableDictionary *m = [o mutableCopy];
+      m[@"value"] = want;
+      [restored addObject:m];
+    } else {
+      [restored addObject:o];
+    }
+  }
+  client.options = restored;
+}
+
+- (void)fillOptions:(NSArray<NSDictionary *> *)options of:(PluginClient *)client into:(NSMenu *)menu {
+  for (NSDictionary *o in options) {
+    if ([o[@"type"] isEqual:@"bool"]) {
+      NSMenuItem *item = [menu addItemWithTitle:o[@"title"] action:@selector(setPluginOption:) keyEquivalent:@""];
+      item.target = self;
+      item.state = [o[@"value"] boolValue] ? NSControlStateValueOn : NSControlStateValueOff;
+      item.representedObject = @{@"client" : client, @"key" : o[@"key"], @"value" : @(![o[@"value"] boolValue])};
+      continue;
+    }
+    NSString *current = @"";
+    for (NSArray *c in o[@"choices"])
+      if ([c[0] isEqual:o[@"value"]]) current = c[1];
+    NSMenu *sub = [self addSubmenu:[NSString stringWithFormat:@"%@: %@", o[@"title"], current] to:menu];
+    for (NSArray *c in o[@"choices"]) {
+      NSMenuItem *item = [sub addItemWithTitle:c[1] action:@selector(setPluginOption:) keyEquivalent:@""];
+      item.target = self;
+      item.state = [c[0] isEqual:o[@"value"]] ? NSControlStateValueOn : NSControlStateValueOff;
+      item.representedObject = @{@"client" : client, @"key" : o[@"key"], @"value" : c[0]};
+    }
+  }
+}
+
+- (void)setPluginOption:(NSMenuItem *)item {
+  PluginClient *client = item.representedObject[@"client"];
+  NSString *key = item.representedObject[@"key"];
+  id value = item.representedObject[@"value"];
+  [self.plugins send:@{@"type" : @"set", @"key" : key, @"value" : value} to:client];
+  NSMutableArray *options = [NSMutableArray array];
+  for (NSDictionary *o in client.options) {
+    NSMutableDictionary *m = [o mutableCopy];
+    if ([o[@"key"] isEqual:key]) m[@"value"] = value;
+    [options addObject:m];
+  }
+  client.options = options;
+  NSMutableDictionary *all = [[NSUserDefaults.standardUserDefaults dictionaryForKey:kDefaultsPluginSettings] mutableCopy]
+                                 ?: [NSMutableDictionary dictionary];
+  NSMutableDictionary *mine = [self savedSettingsFor:client.name];
+  mine[key] = value;
+  all[client.name] = mine;
+  [NSUserDefaults.standardUserDefaults setObject:all forKey:kDefaultsPluginSettings];
 }
 
 - (void)stopPlugin:(NSMenuItem *)item {

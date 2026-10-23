@@ -25,6 +25,8 @@ public final class PocketViewer {
   public var onVideo: ((VideoFrame) -> Void)?
   public var onAudio: ((AudioChunk) -> Void)?
   public var onState: (([String: Any]) -> Void)?
+  /// The user changed one of the settings declared with `setOptions` (key, value).
+  public var onSet: ((String, Any) -> Void)?
   public private(set) var state: [String: Any] = [:]
 
   private let fd: Int32
@@ -51,6 +53,7 @@ public final class PocketViewer {
     }
     var one: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+    _ = fcntl(fd, F_SETFD, FD_CLOEXEC)  // a plugin that re-execs itself must not keep this connection open
     send(["type": "hello", "name": name, "token": ProcessInfo.processInfo.environment["POCKET_VIEWER_TOKEN"] ?? ""])
   }
 
@@ -99,6 +102,12 @@ public final class PocketViewer {
     send(m)
   }
 
+  /// Declares user-adjustable settings, shown in pocket-viewer's Plugins menu:
+  /// ["key": "follow", "title": "Follow", "type": "bool", "value": true] or
+  /// ["key": "to", "title": "Translate to", "type": "choice", "choices": [["en", "English"], ...], "value": "en"].
+  /// Changes arrive through `onSet`; send this again whenever values change.
+  public func setOptions(_ items: [[String: Any]]) { send(["type": "options", "items": items]) }
+
   public func zoom(_ zoom: Double) { send(["type": "zoom", "zoom": zoom]) }
   public func log(_ text: String) { send(["type": "log", "text": text]) }
 
@@ -125,6 +134,8 @@ public final class PocketViewer {
       guard let payload = size > 0 ? readExact(size) : Data() else { return }
       switch h["type"] as? String {
       case "hello": onHello?(h)
+      case "set":
+        if let key = h["key"] as? String, let value = h["value"] { onSet?(key, value) }
       case "state":
         state = h
         onState?(h)
