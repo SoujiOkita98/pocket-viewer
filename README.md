@@ -90,7 +90,11 @@ Boxes("boxes").run(video={"maxWidth": 320, "fps": 5})
 ```
 
 - **face-follow** uses Apple Vision to box every face. It turns the gimbal to keep the largest one centered a little above the middle, and moves only once the gimbal has settled, so it converges without oscillating. Pass `--no-follow` to only draw.
-- **interpreter** recognizes speech on-device with Apple Speech and shows the phrase being spoken. At each pause it translates the phrase with the OpenAI API (`gpt-5.4-mini` by default) and shows the translation as a subtitle. Put your key in `$OPENAI_API_KEY` or a `.openai-key` file, which is git-ignored. On first run, macOS asks for speech-recognition permission.
+- **interpreter** shows live subtitles with one of two engines:
+  - `--asr apple` (the default): speech is recognized on-device with Apple Speech, and each phrase is translated with the OpenAI API (`gpt-5.4-mini`) once the speaker pauses. On first run, macOS asks for speech-recognition permission.
+  - `--asr openai`: the audio streams to OpenAI's `gpt-realtime-translate`, which transcribes and translates while the speaker is still talking. It is noticeably more accurate, and audio is uploaded continuously and billed per minute.
+
+  Put your key in `$OPENAI_API_KEY` or a `.openai-key` file, which is git-ignored.
 
 ## pocketctl
 

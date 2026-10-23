@@ -1,16 +1,23 @@
 // interpreter — pocket-viewer plugin: live subtitles of what's said, with a
 // running translation.
 //
-// Speech is recognized locally with Apple's Speech framework (on-device when
-// the language supports it); each phrase is translated with the OpenAI API
-// once the speaker pauses. Without an API key it only shows the transcript.
+// Two engines:
+//   --asr apple (default)  Apple Speech recognizes locally (on-device when the
+//                          language supports it); each phrase is translated with
+//                          the OpenAI chat API once the speaker pauses. Without
+//                          an API key it only shows the transcript.
+//   --asr openai           OpenAI's gpt-realtime-translate streams recognition
+//                          and translation together, while the speaker talks.
+//                          Audio is uploaded continuously (billed per minute).
 //
-//   interpreter [--from zh-CN] [--to English] [--model gpt-5.4-mini] [--key-file path]
+//   interpreter [--asr apple|openai] [--from zh-CN] [--to English] [--model gpt-5.4-mini]
+//               [--pause 1.5] [--key-file path]
 //
 // The key comes from --key-file, $OPENAI_API_KEY, ./.openai-key or
 // ~/.config/pocket-viewer/openai-key, in that order.
 
 import AVFoundation
+import CryptoKit
 import Foundation
 import Speech
 
@@ -18,8 +25,9 @@ struct Options {
   var from = Locale.current.identifier
   var to = "English"
   var model = "gpt-5.4-mini"
-  var pause = 0.9  // seconds of no new words that end a phrase
+  var pause = 1.5  // seconds of no new words that end a phrase; shorter splits sentences mid-thought
   var keyFile: String?
+  var asr = "apple"
 
   init(_ args: [String]) {
     var it = args.dropFirst().makeIterator()
@@ -29,8 +37,10 @@ struct Options {
       case "--to": to = it.next() ?? to
       case "--model": model = it.next() ?? model
       case "--key-file": keyFile = it.next()
+      case "--pause": pause = Double(it.next() ?? "") ?? pause
+      case "--asr": asr = it.next() ?? asr
       default:
-        FileHandle.standardError.write("usage: interpreter [--from zh-CN] [--to English] [--model m] [--key-file path]\n".data(using: .utf8)!)
+        FileHandle.standardError.write("usage: interpreter [--asr apple|openai] [--from zh-CN] [--to English] [--model m] [--pause secs] [--key-file path]\n".data(using: .utf8)!)
         exit(2)
       }
     }
@@ -281,21 +291,137 @@ final class Recognizer {
   }
 }
 
+/// --asr openai. gpt-realtime-translate takes a continuous 24 kHz PCM16 stream
+/// (silence included) and returns source-transcript and translation deltas
+/// while the speaker talks. It has no turn or "done" events, so callers cut
+/// sentences at sentence-ending punctuation. Translated audio is ignored.
+final class RealtimeTranslator: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+  static let rate = 24000
+  private let key: String
+  private let language: String
+  private let queue = DispatchQueue(label: "realtime")
+  private var socket: URLSessionWebSocketTask?  // queue only
+  private var pending = Data()                  // audio waiting to go out in 100 ms chunks
+  var onSource: ((String) -> Void)?
+  var onTarget: ((String) -> Void)?
+  var onLog: ((String) -> Void)?
+
+  init(key: String, language: String) {
+    self.key = key
+    self.language = language
+    super.init()
+    queue.async { self.connect() }
+  }
+
+  // queue
+  private func connect() {
+    var req = URLRequest(url: URL(string: "wss://api.openai.com/v1/realtime/translations?model=gpt-realtime-translate")!)
+    req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+    // Abuse monitoring wants a stable, non-identifying per-user id.
+    let user = SHA256.hash(data: Data(NSUserName().utf8)).map { String(format: "%02x", $0) }.joined()
+    req.setValue(user, forHTTPHeaderField: "OpenAI-Safety-Identifier")
+    let ws = URLSession(configuration: .default, delegate: self, delegateQueue: nil).webSocketTask(with: req)
+    socket = ws
+    ws.resume()
+    // Source transcripts are off by default (session.audio.input.transcription
+    // is null in session.created, contrary to the guide); enable them.
+    send(["type": "session.update", "session": ["audio": [
+      "input": ["transcription": ["model": "gpt-live-transcribe"]],
+      "output": ["language": language],
+    ]]])
+    receive(on: ws)
+  }
+
+  // queue
+  private func send(_ message: [String: Any]) {
+    guard let ws = socket, let data = try? JSONSerialization.data(withJSONObject: message),
+          let text = String(data: data, encoding: .utf8) else { return }
+    ws.send(.string(text)) { _ in }  // failures surface in receive()
+  }
+
+  private func receive(on ws: URLSessionWebSocketTask) {
+    ws.receive { [weak self] result in
+      guard let self else { return }
+      switch result {
+      case .success(.string(let text)):
+        self.handle(text)
+        self.receive(on: ws)
+      case .success:
+        self.receive(on: ws)
+      case .failure(let error):
+        self.onLog?("realtime connection lost (\(error.localizedDescription)); reconnecting")
+        self.queue.asyncAfter(deadline: .now() + 2) {
+          if self.socket === ws { self.connect() }
+        }
+      }
+    }
+  }
+
+  private func handle(_ text: String) {
+    guard let data = text.data(using: .utf8),
+          let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+    switch msg["type"] as? String {
+    case "session.input_transcript.delta": onSource?(msg["delta"] as? String ?? "")
+    case "session.output_transcript.delta": onTarget?(msg["delta"] as? String ?? "")
+    case "error":
+      let err = msg["error"] as? [String: Any]
+      onLog?("realtime error: \(err?["message"] as? String ?? text)")
+    default: break  // session.created, translated audio, ...
+    }
+  }
+
+  func append(_ chunk: AudioChunk) {
+    guard Int(chunk.rate) == RealtimeTranslator.rate, chunk.channels == 1 else { return }
+    queue.async {
+      self.pending.append(chunk.data)
+      guard self.pending.count >= RealtimeTranslator.rate / 10 * 2 else { return }
+      self.send(["type": "session.input_audio_buffer.append", "audio": self.pending.base64EncodedString()])
+      self.pending.removeAll(keepingCapacity: true)
+    }
+  }
+}
+
+/// Splits a growing stream of text into finished sentences and the rest.
+struct SentenceBuffer {
+  private(set) var current = ""
+  mutating func append(_ delta: String) -> [String] {
+    current += delta
+    var done: [String] = []
+    while let end = current.firstIndex(where: { "。！？.!?".contains($0) }) {
+      let sentence = current[...end].trimmingCharacters(in: .whitespaces)
+      current = String(current[current.index(after: end)...])
+      if !sentence.isEmpty { done.append(sentence) }
+    }
+    return done
+  }
+}
+
+/// gpt-realtime-translate wants a language code; accept common names too.
+func languageCode(_ name: String) -> String {
+  let codes = ["english": "en", "chinese": "zh", "japanese": "ja", "korean": "ko", "spanish": "es", "french": "fr",
+               "german": "de", "italian": "it", "portuguese": "pt", "russian": "ru", "arabic": "ar", "hindi": "hi"]
+  return codes[name.lowercased()] ?? name
+}
+
 /// The subtitle overlay: the phrase being spoken under the last two
 /// translations. All state lives on one serial queue.
 final class Subtitles: @unchecked Sendable {
   private let pv: PocketViewer
   private let queue = DispatchQueue(label: "subtitles")
   private var translations: [String] = []
+  private var current = ""  // translation still being streamed (--asr openai)
   private var partial = ""
 
   init(_ pv: PocketViewer) { self.pv = pv }
 
   func setPartial(_ text: String) { queue.async { self.partial = text; self.redraw() } }
   func add(_ translation: String) { queue.async { self.translations.append(translation); self.redraw() } }
+  func setCurrent(_ text: String) { queue.async { self.current = text; self.redraw() } }
 
   private func redraw() {
-    var items: [[String: Any]] = translations.suffix(2).map { ["shape": "subtitle", "text": $0, "size": 26] }
+    var lines = Array(translations.suffix(2))
+    if !current.isEmpty { lines.append(current) }
+    var items: [[String: Any]] = lines.suffix(3).map { ["shape": "subtitle", "text": $0, "size": 26] }
     if !partial.isEmpty {
       items.append(["shape": "subtitle", "text": partial, "size": 18, "color": "#ffffffb0", "background": "#00000060"])
     }
@@ -314,6 +440,8 @@ struct Interpreter {
       FileHandle.standardError.write("\(error.localizedDescription)\n".data(using: .utf8)!)
       exit(1)
     }
+
+    if opt.asr == "openai" { runRealtime(pv, opt) }
 
     let auth = DispatchSemaphore(value: 0)
     var status = SFSpeechRecognizerAuthorizationStatus.notDetermined
@@ -359,5 +487,42 @@ struct Interpreter {
     }
     rec.start()
     RunLoop.main.run()
+  }
+
+  static func runRealtime(_ pv: PocketViewer, _ opt: Options) -> Never {
+    guard let key = openAIKey(file: opt.keyFile) else {
+      pv.log("--asr openai needs an OpenAI key ($OPENAI_API_KEY, ./.openai-key or --key-file)")
+      exit(1)
+    }
+    let lang = languageCode(opt.to)
+    let rt = RealtimeTranslator(key: key, language: lang)
+    let subtitles = Subtitles(pv)
+    let lock = NSLock()
+    var source = SentenceBuffer(), target = SentenceBuffer()
+    rt.onLog = { pv.log($0) }
+    rt.onSource = { delta in
+      lock.lock()
+      let done = source.append(delta)
+      let tail = String(source.current.suffix(40))
+      lock.unlock()
+      for s in done { pv.log("「\(s)」") }
+      subtitles.setPartial(tail)
+    }
+    rt.onTarget = { delta in
+      lock.lock()
+      let done = target.append(delta)
+      let current = target.current
+      lock.unlock()
+      for s in done {
+        pv.log("→ 「\(s)」")
+        subtitles.add(s)
+      }
+      subtitles.setCurrent(current)
+    }
+    pv.log("listening → \(lang) via gpt-realtime-translate (streaming)")
+    pv.onAudio = { rt.append($0) }
+    pv.subscribe(audio: ["rate": RealtimeTranslator.rate, "channels": 1])
+    pv.run()
+    exit(0)
   }
 }
